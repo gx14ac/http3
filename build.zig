@@ -51,4 +51,79 @@ pub fn build(b: *std.Build) void {
         .root_module = hpack_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(hpack_tests).step);
+
+    // Stream tests
+    const stream_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/h2/stream.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const stream_tests = b.addTest(.{
+        .root_module = stream_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(stream_tests).step);
+
+    // Connection tests
+    const conn_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/h2/connection.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const conn_tests = b.addTest(.{
+        .root_module = conn_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(conn_tests).step);
+
+    // Client tests
+    const client_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/h2/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const client_tests = b.addTest(.{
+        .root_module = client_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(client_tests).step);
+
+    // gRPC message tests
+    const grpc_msg_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/grpc/message.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const grpc_msg_tests = b.addTest(.{
+        .root_module = grpc_msg_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(grpc_msg_tests).step);
+
+    // Fuzz tests
+    // - Seed-corpus validation: zig build fuzz
+    // - Continuous fuzzing (Linux only): zig build fuzz --fuzz
+    //   (macOS unsupported in Zig 0.15 — std.debug.Info is ELF-only)
+    const fuzz_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/h2/fuzz_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fuzz_tests = b.addTest(.{
+        .root_module = fuzz_test_mod,
+    });
+    const run_fuzz = b.addRunArtifact(fuzz_tests);
+    const fuzz_step = b.step("fuzz", "Run fuzz tests");
+    fuzz_step.dependOn(&run_fuzz.step);
+
+    // Integration tests (requires external gRPC server on localhost:50051)
+    const integration_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/smoke_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_test_mod.addImport("http3", lib_mod);
+    const integration_tests = b.addTest(.{
+        .root_module = integration_test_mod,
+    });
+    const run_integration = b.addRunArtifact(integration_tests);
+    const integration_step = b.step("integration-test", "Run integration tests (requires gRPC server on :50051)");
+    integration_step.dependOn(&run_integration.step);
+
 }

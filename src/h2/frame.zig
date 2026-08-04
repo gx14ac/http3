@@ -231,8 +231,9 @@ pub fn buildSettingsAck(buf: *[9]u8) []u8 {
     return buf;
 }
 
-/// Build a WINDOW_UPDATE frame.
-pub fn buildWindowUpdate(stream_id: u31, increment: u31, buf: *[13]u8) []u8 {
+/// Build a WINDOW_UPDATE frame. increment must be > 0 (RFC 9113 §6.9).
+pub fn buildWindowUpdate(stream_id: u31, increment: u31, buf: *[13]u8) ![]u8 {
+    if (increment == 0) return error.ProtocolError;
     const header = FrameHeader{
         .length = 4,
         .frame_type = .window_update,
@@ -401,7 +402,7 @@ test "buildSettings writes directly without intermediate copy" {
 
 test "buildWindowUpdate" {
     var buf: [13]u8 = undefined;
-    _ = buildWindowUpdate(1, 65535, &buf);
+    _ = try buildWindowUpdate(1, 65535, &buf);
 
     const header = FrameHeader.decode(buf[0..9]);
     try std.testing.expectEqual(FrameType.window_update, header.frame_type);
@@ -410,6 +411,11 @@ test "buildWindowUpdate" {
 
     const increment = std.mem.readInt(u32, buf[9..13], .big);
     try std.testing.expectEqual(@as(u32, 65535), increment);
+}
+
+test "buildWindowUpdate rejects zero increment" {
+    var buf: [13]u8 = undefined;
+    try std.testing.expectError(error.ProtocolError, buildWindowUpdate(1, 0, &buf));
 }
 
 test "buildPing roundtrip" {
