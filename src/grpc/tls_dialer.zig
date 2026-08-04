@@ -148,8 +148,8 @@ const AlpnWriter = struct {
         for (data[0 .. data.len - 1]) |bytes| total_len += bytes.len;
         total_len += data[data.len - 1].len * splat;
 
-        // Assemble into a contiguous buffer
-        var record_buf: [8192]u8 = undefined;
+        // Assemble into a contiguous buffer (sized to match TLS max record)
+        var record_buf: [tls.Client.min_buffer_len]u8 = undefined;
         if (total_len > record_buf.len) {
             return passthroughDrain(io_w, self.stream_writer, data, splat);
         }
@@ -168,7 +168,7 @@ const AlpnWriter = struct {
         }
 
         // Inject ALPN extension
-        var patched_buf: [8192 + alpn_extension.len]u8 = undefined;
+        var patched_buf: [tls.Client.min_buffer_len + alpn_extension.len]u8 = undefined;
         const patched_len = injectAlpnIntoClientHello(record_buf[0..pos], &patched_buf) orelse {
             return passthroughDrain(io_w, self.stream_writer, data, splat);
         };
@@ -314,6 +314,8 @@ fn tlsWriteFn(ctx: *const anyopaque, data: []const u8) anyerror!usize {
 
 fn tlsCloseFn(ctx: *anyopaque) void {
     const conn: *TlsConn = @alignCast(@ptrCast(ctx));
+    // Best-effort TLS close_notify (RFC 8446 §6.1)
+    conn.tls_client.writer.flush() catch {};
     conn.tcp_stream.close();
     conn.allocator.destroy(conn);
 }

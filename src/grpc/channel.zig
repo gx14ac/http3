@@ -416,6 +416,10 @@ pub const Channel = struct {
     /// Check keepalive state before an RPC. If a ping is outstanding and timed out,
     /// mark connection as disconnected (auto-reconnect will handle it on next attempt).
     /// If interval has elapsed since last activity, send a keepalive ping.
+    ///
+    /// NOTE: This is a passive check — it only runs at RPC boundaries. Idle connections
+    /// with no RPCs are NOT kept alive. Callers that hold long-lived idle channels should
+    /// perform periodic health checks or dummy RPCs to prevent server-side idle timeouts.
     fn keepaliveCheck(self: *Channel) void {
         if (self.keepalive.interval_ms == 0) return;
         if (self.channel_state != .connected) return;
