@@ -38,6 +38,10 @@ pub const DialResult = dialer.DialResult;
 
 pub const TlsDialer = tls_dialer.TlsDialer;
 
+pub const health = @import("health.zig");
+pub const HealthClient = health.HealthClient;
+pub const ServingStatus = health.ServingStatus;
+
 pub const StreamInterceptor = stream_interceptor.StreamInterceptor;
 pub const StreamInterceptorChain = stream_interceptor.StreamInterceptorChain;
 pub const StreamInvoker = stream_interceptor.StreamInvoker;
@@ -54,5 +58,6 @@ test {
     _ = balancer;
     _ = dialer;
     _ = tls_dialer;
+    _ = health;
     _ = @import("integration_test.zig");
 }
