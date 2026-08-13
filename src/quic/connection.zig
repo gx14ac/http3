@@ -106,6 +106,8 @@ pub const Connection = struct {
     path_validated: bool,
     migration: migration_mod.MigrationManager,
 
+    /// Legacy init — uses NewReno for backward compatibility with existing tests.
+    /// Production code should use QuicClient (which defaults to Cubic via QuicConfig).
     pub fn init(dcid: []const u8, scid: []const u8) Connection {
         return initWithConfig(dcid, scid, .new_reno);
     }
