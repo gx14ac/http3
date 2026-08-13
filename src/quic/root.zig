@@ -177,9 +177,11 @@ pub const UnaryResult = grpc_e2e.UnaryResult;
 
 pub const client = @import("client.zig");
 pub const QuicClient = client.QuicClient;
+pub const QuicConfig = client.QuicConfig;
 
 pub const h3_client = @import("h3_client.zig");
 pub const H3Client = h3_client.H3Client;
+pub const H3Config = h3_client.H3Client.H3Config;
 pub const H3Response = h3_client.H3Response;
 pub const H3StreamHandle = h3_client.H3StreamHandle;
 

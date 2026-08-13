@@ -27,6 +27,7 @@ pub const H3PoolConfig = struct {
     max_conns: u8 = 4,
     max_requests_per_conn: u16 = 100,
     keepalive: KeepaliveConfig = .{},
+    congestion: h3_client_mod.H3Client.H3Config = .{},
 };
 
 pub const H3ConnState = enum {
@@ -222,7 +223,7 @@ pub const H3Pool = struct {
         const client = self.allocator.create(H3Client) catch return H3PoolError.ConnectionFailed;
         errdefer self.allocator.destroy(client);
 
-        client.* = H3Client.init(self.remote, self.server_name[0..self.server_name_len]) catch {
+        client.* = H3Client.initWithConfig(self.remote, self.server_name[0..self.server_name_len], self.config.congestion) catch {
             return H3PoolError.ConnectionFailed;
         };
         errdefer client.deinit();

@@ -107,6 +107,10 @@ pub const Connection = struct {
     migration: migration_mod.MigrationManager,
 
     pub fn init(dcid: []const u8, scid: []const u8) Connection {
+        return initWithConfig(dcid, scid, .new_reno);
+    }
+
+    pub fn initWithConfig(dcid: []const u8, scid: []const u8, cc_algo: loss_mod.CongestionAlgorithm) Connection {
         var conn: Connection = undefined;
         conn.state = .idle;
         conn.dcid_len = @min(dcid.len, 20);
@@ -140,7 +144,7 @@ pub const Connection = struct {
         conn.server_hello_len = 0;
         conn.x25519_private_key = [_]u8{0} ** 32;
         conn.close_ctrl = conn_close.CloseController.init();
-        conn.loss = loss_mod.LossDetector.init();
+        conn.loss = loss_mod.LossDetector.initWithAlgo(cc_algo, 0);
         conn.send_buf = retransmit_mod.SendBuffer.init();
         conn.rtx_queue = retransmit_mod.RetransmitQueue.init();
         conn.key_mgr = null;

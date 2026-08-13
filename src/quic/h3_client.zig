@@ -129,13 +129,21 @@ pub const H3Client = struct {
         }
     };
 
+    pub const H3Config = struct {
+        congestion: client_mod.CongestionAlgorithm = .cubic,
+    };
+
     pub fn init(remote: std.net.Address, server_name: []const u8) !H3Client {
+        return initWithConfig(remote, server_name, .{});
+    }
+
+    pub fn initWithConfig(remote: std.net.Address, server_name: []const u8, config: H3Config) !H3Client {
         var dcid: [8]u8 = undefined;
         var scid: [8]u8 = undefined;
         std.crypto.random.bytes(&dcid);
         std.crypto.random.bytes(&scid);
 
-        var quic_client = try QuicClient.init(remote, &dcid, &scid);
+        var quic_client = try QuicClient.initWithConfig(remote, &dcid, &scid, .{ .congestion = config.congestion });
         errdefer quic_client.deinit();
 
         var name_buf: [256]u8 = undefined;

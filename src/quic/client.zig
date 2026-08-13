@@ -44,6 +44,12 @@ pub const ConnectError = error{
     HandshakeFailed,
 };
 
+pub const CongestionAlgorithm = loss_mod.CongestionAlgorithm;
+
+pub const QuicConfig = struct {
+    congestion: CongestionAlgorithm = .cubic,
+};
+
 /// Integrated QUIC client: Connection + UdpSocket + event loop.
 ///
 /// Provides a blocking, poll-based interface that ties together:
@@ -70,11 +76,15 @@ pub const QuicClient = struct {
     const MAX_TIMEOUT_MS: u64 = 30_000;
 
     pub fn init(remote: std.net.Address, dcid: []const u8, scid: []const u8) !QuicClient {
+        return initWithConfig(remote, dcid, scid, .{});
+    }
+
+    pub fn initWithConfig(remote: std.net.Address, dcid: []const u8, scid: []const u8, config: QuicConfig) !QuicClient {
         var socket = try UdpSocket.init(remote);
         errdefer socket.close();
 
         return .{
-            .conn = Connection.init(dcid, scid),
+            .conn = Connection.initWithConfig(dcid, scid, config.congestion),
             .socket = socket,
             .send_buf = undefined,
             .recv_buf = undefined,
@@ -563,12 +573,12 @@ test "QuicClient: underutilized detection" {
     const now = QuicClient.nowUs();
     // No data in flight, CC allows sending → underutilized
     client.updateUnderutilized(now);
-    try std.testing.expect(client.conn.loss.cc.new_reno.underutilized);
+    try std.testing.expect(client.conn.loss.cc.cubic.underutilized);
 
     // Fill up the window → not underutilized
-    client.conn.loss.cc.new_reno.bytes_in_flight = client.conn.loss.cc.new_reno.congestion_window;
+    client.conn.loss.cc.cubic.bytes_in_flight = client.conn.loss.cc.cubic.congestion_window;
     client.updateUnderutilized(now);
-    try std.testing.expect(!client.conn.loss.cc.new_reno.underutilized);
+    try std.testing.expect(!client.conn.loss.cc.cubic.underutilized);
 }
 
 test "QuicClient: sendLimit integration" {
@@ -584,7 +594,7 @@ test "QuicClient: sendLimit integration" {
     try std.testing.expectEqual(SendLimit.ok, lim.limit);
 
     // Fill window → limited
-    client.conn.loss.cc.new_reno.bytes_in_flight = client.conn.loss.cc.new_reno.congestion_window;
+    client.conn.loss.cc.cubic.bytes_in_flight = client.conn.loss.cc.cubic.congestion_window;
     const lim2 = client.conn.loss.sendLimit(now);
     try std.testing.expectEqual(SendLimit.limited, lim2.limit);
 }
