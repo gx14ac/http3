@@ -1653,10 +1653,10 @@ test "Connection: onPacketSentLD tracks bytes in flight" {
     var conn = Connection.init(&dcid, &scid);
 
     conn.onPacketSentLD(.application, 0, 1200, true, 1_000_000);
-    try std.testing.expectEqual(@as(u64, 1200), conn.loss.cc.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 1200), conn.loss.cc.new_reno.bytes_in_flight);
 
     conn.onPacketSentLD(.application, 1, 1200, true, 1_001_000);
-    try std.testing.expectEqual(@as(u64, 2400), conn.loss.cc.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 2400), conn.loss.cc.new_reno.bytes_in_flight);
 }
 
 test "Connection: canSendCC respects congestion window" {
@@ -1705,7 +1705,7 @@ test "Connection: sendTracked registers with loss detector" {
     const result = conn.sendTracked(&buf, "hello", 1_000_000) orelse unreachable;
     try std.testing.expect(result.len > 0);
     try std.testing.expectEqual(@as(u64, 0), result.pn);
-    try std.testing.expect(conn.loss.cc.bytes_in_flight > 0);
+    try std.testing.expect(conn.loss.cc.new_reno.bytes_in_flight > 0);
     try std.testing.expectEqual(@as(u64, 1), conn.app_level.send_pn);
     try std.testing.expect(conn.loss.getTimer() != null);
 }
@@ -1722,7 +1722,7 @@ test "Connection: sendTracked respects CC" {
     conn.state = .connected;
 
     // Fill congestion window
-    conn.loss.cc.bytes_in_flight = 12000;
+    conn.loss.cc.new_reno.bytes_in_flight = 12000;
 
     var buf: [256]u8 = undefined;
     // Should be blocked by CC
@@ -1752,10 +1752,10 @@ test "Connection: discardLossLevel clears initial bytes in flight" {
 
     conn.onPacketSentLD(.initial, 0, 1200, true, 1_000_000);
     conn.onPacketSentLD(.initial, 1, 1200, true, 1_001_000);
-    try std.testing.expectEqual(@as(u64, 2400), conn.loss.cc.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 2400), conn.loss.cc.new_reno.bytes_in_flight);
 
     conn.discardLossLevel(.initial);
-    try std.testing.expectEqual(@as(u64, 0), conn.loss.cc.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 0), conn.loss.cc.new_reno.bytes_in_flight);
 }
 
 test "Connection: close uses real PTO when pto_us=0" {
@@ -1895,7 +1895,7 @@ test "Connection.sendStream: records in send buffer" {
     const len = conn.sendStream(&buf, 4, 0, "hello", false, 1_000_000) orelse unreachable;
     try std.testing.expect(len > 0);
     try std.testing.expectEqual(@as(usize, 1), conn.send_buf.pending());
-    try std.testing.expect(conn.loss.cc.bytes_in_flight > 0);
+    try std.testing.expect(conn.loss.cc.new_reno.bytes_in_flight > 0);
 }
 
 test "Connection.hasRetransmits: false initially" {
@@ -1919,7 +1919,7 @@ test "Connection.sendProbe: sends PING when no retransmits" {
     var buf: [256]u8 = undefined;
     const len = conn.sendProbe(&buf, 1_000_000) orelse unreachable;
     try std.testing.expect(len > 0);
-    try std.testing.expect(conn.loss.cc.bytes_in_flight > 0);
+    try std.testing.expect(conn.loss.cc.new_reno.bytes_in_flight > 0);
 }
 
 test "Connection: sendStream → loss → retransmit cycle" {

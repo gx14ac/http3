@@ -1,6 +1,7 @@
 const std = @import("std");
 const packet_mod = @import("packet.zig");
 const ack_mod = @import("ack.zig");
+const cubic_mod = @import("cubic.zig");
 
 /// A contiguous range of acknowledged packet numbers [start, end] inclusive.
 pub const AckRange = struct {
@@ -527,13 +528,145 @@ pub const SendLimit = enum {
     paced,
 };
 
+/// Congestion control algorithm selection.
+pub const CongestionAlgorithm = enum {
+    new_reno,
+    cubic,
+};
+
+/// Unified CC dispatch layer. Delegates to either NewReno or Cubic.
+pub const CcState = struct {
+    algo: CongestionAlgorithm,
+    new_reno: CongestionController,
+    cubic: cubic_mod.CubicCc,
+
+    pub fn init(algo: CongestionAlgorithm) CcState {
+        return initWithMds(algo, 1200);
+    }
+
+    pub fn initWithMds(algo: CongestionAlgorithm, mds: u64) CcState {
+        return .{
+            .algo = algo,
+            .new_reno = CongestionController.initWithMds(mds),
+            .cubic = cubic_mod.CubicCc.initWithMds(mds),
+        };
+    }
+
+    pub fn canSend(self: *const CcState) bool {
+        return switch (self.algo) {
+            .new_reno => self.new_reno.canSend(),
+            .cubic => self.cubic.canSend(),
+        };
+    }
+
+    pub fn sendBudget(self: *const CcState) u64 {
+        return switch (self.algo) {
+            .new_reno => self.new_reno.sendBudget(),
+            .cubic => self.cubic.sendBudget(),
+        };
+    }
+
+    pub fn congestionWindow(self: *const CcState) u64 {
+        return switch (self.algo) {
+            .new_reno => self.new_reno.congestion_window,
+            .cubic => self.cubic.congestion_window,
+        };
+    }
+
+    pub fn bytesInFlight(self: *const CcState) u64 {
+        return switch (self.algo) {
+            .new_reno => self.new_reno.bytes_in_flight,
+            .cubic => self.cubic.bytes_in_flight,
+        };
+    }
+
+    /// Subtract evicted bytes from bytes_in_flight (ring buffer slot reuse).
+    pub fn adjustBytesInFlight(self: *CcState, evicted: u32) void {
+        switch (self.algo) {
+            .new_reno => {
+                if (self.new_reno.bytes_in_flight >= evicted) {
+                    self.new_reno.bytes_in_flight -= evicted;
+                }
+            },
+            .cubic => {
+                if (self.cubic.bytes_in_flight >= evicted) {
+                    self.cubic.bytes_in_flight -= evicted;
+                }
+            },
+        }
+    }
+
+    pub fn setUnderutilized(self: *CcState, v: bool) void {
+        switch (self.algo) {
+            .new_reno => self.new_reno.setUnderutilized(v),
+            .cubic => self.cubic.setUnderutilized(v),
+        }
+    }
+
+    pub fn packetSent(self: *CcState, sent: *const SentPacket) void {
+        switch (self.algo) {
+            .new_reno => self.new_reno.packetSent(sent),
+            .cubic => self.cubic.packetSent(sent),
+        }
+    }
+
+    pub fn packetAcked(self: *CcState, sent: *const SentPacket) void {
+        switch (self.algo) {
+            .new_reno => self.new_reno.packetAcked(sent),
+            .cubic => self.cubic.packetAcked(sent),
+        }
+    }
+
+    pub fn packetLost(self: *CcState, space: usize, sent: *const SentPacket, rtt: *const RttEstimator) void {
+        switch (self.algo) {
+            .new_reno => self.new_reno.packetLost(space, sent, rtt),
+            .cubic => self.cubic.packetLost(space, sent, rtt),
+        }
+    }
+
+    pub fn packetBatchEnd(self: *CcState, now_us: u64, space: usize, rtt: *RttEstimator, max_ack_delay_us: u64) void {
+        switch (self.algo) {
+            .new_reno => self.new_reno.packetBatchEnd(now_us, space, rtt, max_ack_delay_us),
+            .cubic => self.cubic.packetBatchEnd(now_us, space, rtt, max_ack_delay_us),
+        }
+    }
+
+    pub fn packetDiscarded(self: *CcState, sent: *const SentPacket) void {
+        switch (self.algo) {
+            .new_reno => self.new_reno.packetDiscarded(sent),
+            .cubic => self.cubic.packetDiscarded(sent),
+        }
+    }
+
+    pub fn inSlowStart(self: *const CcState) bool {
+        return switch (self.algo) {
+            .new_reno => self.new_reno.inSlowStart(),
+            .cubic => self.cubic.inSlowStart(),
+        };
+    }
+
+    pub fn inRecovery(self: *const CcState) bool {
+        return switch (self.algo) {
+            .new_reno => self.new_reno.inRecovery(),
+            .cubic => self.cubic.inRecovery(),
+        };
+    }
+
+    pub fn sendOnePacketInRecovery(self: *const CcState) bool {
+        return switch (self.algo) {
+            .new_reno => self.new_reno.send_one_packet_in_recovery,
+            .cubic => self.cubic.send_one_packet_in_recovery,
+        };
+    }
+};
+
 /// Integrated loss detection + congestion controller + pacer (RFC 9002).
 ///
 /// Uses Go-style batch processing: receiveAckStart → receiveAckRange × N → receiveAckEnd.
 /// The cwnd is only modified once per ACK frame in receiveAckEnd.
 pub const LossDetector = struct {
     rtt: RttEstimator,
-    cc: CongestionController,
+    cc: CcState,
     pacer: Pacer,
     levels: [NUMBER_SPACE_COUNT]LossDetectionLevel,
     pto_count: u32,
@@ -549,12 +682,12 @@ pub const LossDetector = struct {
         return initWithTime(0);
     }
 
-    pub fn initWithTime(now_us: u64) LossDetector {
-        const cc = CongestionController.init();
+    pub fn initWithAlgo(algo: CongestionAlgorithm, now_us: u64) LossDetector {
+        const cc = CcState.init(algo);
         return .{
             .rtt = RttEstimator.init(),
             .cc = cc,
-            .pacer = Pacer.init(now_us, cc.congestion_window, K_GRANULARITY_US),
+            .pacer = Pacer.init(now_us, cc.congestionWindow(), K_GRANULARITY_US),
             .levels = [_]LossDetectionLevel{LossDetectionLevel.init()} ** NUMBER_SPACE_COUNT,
             .pto_count = 0,
             .loss_detection_timer_us = null,
@@ -563,6 +696,10 @@ pub const LossDetector = struct {
             .ack_frame_rtt_us = null,
             .ack_frame_contains_ack_eliciting = false,
         };
+    }
+
+    pub fn initWithTime(now_us: u64) LossDetector {
+        return initWithAlgo(.new_reno, now_us);
     }
 
     fn levelIndex(level: ack_mod.EncryptionLevel) usize {
@@ -575,7 +712,7 @@ pub const LossDetector = struct {
 
     /// Convenience: bytes currently in flight (owned by CC).
     pub fn bytesInFlight(self: *const LossDetector) u64 {
-        return self.cc.bytes_in_flight;
+        return self.cc.bytesInFlight();
     }
 
     /// Check if sending is allowed and return the limiting factor.
@@ -586,7 +723,7 @@ pub const LossDetector = struct {
         if (!self.cc.canSend()) {
             return .{ .limit = .limited, .next_us = 0 };
         }
-        if (self.cc.bytes_in_flight == 0) {
+        if (self.cc.bytesInFlight() == 0) {
             return .{ .limit = .ok, .next_us = 0 };
         }
         const pacer_result = self.pacer.canSend(now_us);
@@ -616,13 +753,11 @@ pub const LossDetector = struct {
         };
         const evicted = self.levels[idx].sent.insert(pkt);
         if (evicted > 0) {
-            if (self.cc.bytes_in_flight >= evicted) {
-                self.cc.bytes_in_flight -= evicted;
-            }
+            self.cc.adjustBytesInFlight(evicted);
         }
 
         self.cc.packetSent(&pkt);
-        self.pacer.packetSent(now_us, size, self.cc.congestion_window, self.rtt.smoothed_rtt_us);
+        self.pacer.packetSent(now_us, size, self.cc.congestionWindow(), self.rtt.smoothed_rtt_us);
 
         if (ack_eliciting) {
             self.levels[idx].time_of_last_ack_eliciting_us = now_us;
@@ -697,7 +832,7 @@ pub const LossDetector = struct {
         // Single cwnd update for the entire batch
         self.cc.packetBatchEnd(now_us, idx, &self.rtt, self.max_ack_delay_us);
 
-        self.pacer.advance(now_us, self.cc.congestion_window, self.rtt.smoothed_rtt_us);
+        self.pacer.advance(now_us, self.cc.congestionWindow(), self.rtt.smoothed_rtt_us);
         self.setLossDetectionTimer(now_us);
 
         return loss_event;
@@ -1309,7 +1444,7 @@ test "LossDetector: batch API prevents multi-halving" {
     while (pn < 10) : (pn += 1) {
         ld.onPacketSent(.application, pn, 1200, true, 1_000_000 + pn * 1000);
     }
-    const cwnd_before = ld.cc.congestion_window;
+    const cwnd_before = ld.cc.congestionWindow();
 
     // ACK only PN 9 → PNs 0-6 are lost (gap >= 3), PN 7,8 not lost
     const event = ld.onAckReceived(.application, 9, 0, 0, 1_100_000);
@@ -1317,8 +1452,8 @@ test "LossDetector: batch API prevents multi-halving" {
 
     // cwnd should be halved ONCE, not 7 times
     const expected_ssthresh = cwnd_before / 2;
-    try std.testing.expectEqual(expected_ssthresh, ld.cc.ssthresh);
-    try std.testing.expect(ld.cc.in_recovery);
+    try std.testing.expectEqual(expected_ssthresh, ld.cc.new_reno.ssthresh);
+    try std.testing.expect(ld.cc.inRecovery());
 }
 
 test "LossDetector: sendLimit reflects pacer state" {
@@ -1328,4 +1463,43 @@ test "LossDetector: sendLimit reflects pacer state" {
     // After sending full cwnd, CC should block
     const result = ld.sendLimit(1_000_000);
     try std.testing.expectEqual(SendLimit.limited, result.limit);
+}
+
+test "LossDetector: Cubic algorithm via initWithAlgo" {
+    var ld = LossDetector.initWithAlgo(.cubic, 1_000_000);
+    try std.testing.expectEqual(CongestionAlgorithm.cubic, ld.cc.algo);
+
+    // Slow start growth
+    ld.onPacketSent(.application, 0, 1200, true, 1_000_000);
+    try std.testing.expectEqual(@as(u64, 1200), ld.bytesInFlight());
+
+    _ = ld.onAckReceived(.application, 0, 0, 0, 1_100_000);
+    try std.testing.expectEqual(@as(u64, 0), ld.bytesInFlight());
+    // cwnd should grow in slow start
+    try std.testing.expect(ld.cc.congestionWindow() > 12000);
+}
+
+test "LossDetector: Cubic β=0.7 on loss" {
+    var ld = LossDetector.initWithAlgo(.cubic, 0);
+
+    // Get an RTT sample first
+    ld.onPacketSent(.application, 0, 1200, true, 1_000_000);
+    _ = ld.onAckReceived(.application, 0, 0, 0, 1_100_000);
+
+    // Set cwnd manually for predictable test
+    ld.cc.cubic.congestion_window = 20000;
+    ld.cc.cubic.ssthresh = 12000;
+
+    // Send 4 packets, ACK only the last → pn 1 lost (gap >= 3)
+    ld.onPacketSent(.application, 1, 1200, true, 2_000_000);
+    ld.onPacketSent(.application, 2, 1200, true, 2_001_000);
+    ld.onPacketSent(.application, 3, 1200, true, 2_002_000);
+    ld.onPacketSent(.application, 4, 1200, true, 2_003_000);
+
+    const event = ld.onAckReceived(.application, 4, 0, 0, 2_100_000);
+    try std.testing.expect(event.lost_count >= 1);
+
+    // Cubic uses β=0.7: ssthresh = 20000 * 7/10 = 14000
+    try std.testing.expectEqual(@as(u64, 14000), ld.cc.cubic.ssthresh);
+    try std.testing.expect(ld.cc.inRecovery());
 }

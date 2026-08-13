@@ -283,7 +283,7 @@ pub const QuicClient = struct {
     /// Update the underutilized flag based on current CC state.
     fn updateUnderutilized(self: *QuicClient, now_us: u64) void {
         const send_lim = self.conn.loss.sendLimit(now_us);
-        const is_underutilized = send_lim.limit == .ok and self.conn.loss.cc.bytes_in_flight < self.conn.loss.cc.congestion_window;
+        const is_underutilized = send_lim.limit == .ok and self.conn.loss.cc.bytesInFlight() < self.conn.loss.cc.congestionWindow();
         self.conn.loss.cc.setUnderutilized(is_underutilized);
     }
 
@@ -563,12 +563,12 @@ test "QuicClient: underutilized detection" {
     const now = QuicClient.nowUs();
     // No data in flight, CC allows sending → underutilized
     client.updateUnderutilized(now);
-    try std.testing.expect(client.conn.loss.cc.underutilized);
+    try std.testing.expect(client.conn.loss.cc.new_reno.underutilized);
 
     // Fill up the window → not underutilized
-    client.conn.loss.cc.bytes_in_flight = client.conn.loss.cc.congestion_window;
+    client.conn.loss.cc.new_reno.bytes_in_flight = client.conn.loss.cc.new_reno.congestion_window;
     client.updateUnderutilized(now);
-    try std.testing.expect(!client.conn.loss.cc.underutilized);
+    try std.testing.expect(!client.conn.loss.cc.new_reno.underutilized);
 }
 
 test "QuicClient: sendLimit integration" {
@@ -584,7 +584,7 @@ test "QuicClient: sendLimit integration" {
     try std.testing.expectEqual(SendLimit.ok, lim.limit);
 
     // Fill window → limited
-    client.conn.loss.cc.bytes_in_flight = client.conn.loss.cc.congestion_window;
+    client.conn.loss.cc.new_reno.bytes_in_flight = client.conn.loss.cc.new_reno.congestion_window;
     const lim2 = client.conn.loss.sendLimit(now);
     try std.testing.expectEqual(SendLimit.limited, lim2.limit);
 }

@@ -159,6 +159,11 @@ pub const MigrationState = migration.MigrationState;
 pub const MigrationEvent = migration.MigrationEvent;
 pub const PeerAddress = migration.PeerAddress;
 
+pub const cubic = @import("cubic.zig");
+pub const CubicCc = cubic.CubicCc;
+pub const CongestionAlgorithm = loss.CongestionAlgorithm;
+pub const CcState = loss.CcState;
+
 pub const qpack_dynamic = @import("qpack_dynamic.zig");
 pub const DynamicTable = qpack_dynamic.DynamicTable;
 pub const DynamicEncoder = qpack_dynamic.DynamicEncoder;
@@ -217,6 +222,7 @@ test {
     _ = conn_close;
     _ = retransmit;
     _ = migration;
+    _ = cubic;
     _ = qpack_dynamic;
     _ = client;
     _ = h3_client;
