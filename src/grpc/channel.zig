@@ -11,6 +11,7 @@ const h2_client = @import("../h2/client.zig");
 const h2_frame = @import("../h2/frame.zig");
 const h2_hpack = @import("../h2/hpack.zig");
 const h2_connection = @import("../h2/connection.zig");
+const conn_pool_mod = @import("conn_pool.zig");
 
 pub const ChannelError = error{
     ConnectionFailed,
@@ -174,6 +175,10 @@ pub const Channel = struct {
     active_dial: ?dialer_mod.DialResult = null,
     last_endpoint: ?resolver_mod.Endpoint = null,
 
+    // Optional connection pool
+    pool: ?*conn_pool_mod.ConnPool = null,
+    pooled_conn: ?*conn_pool_mod.PooledConn = null,
+
     pub fn init(
         allocator: std.mem.Allocator,
         reader: std.io.AnyReader,
@@ -241,6 +246,12 @@ pub const Channel = struct {
         self.keepalive = config;
     }
 
+    /// Attach a connection pool. When set, the channel acquires/releases
+    /// connections from the pool instead of managing a single dial.
+    pub fn withPool(self: *Channel, p: *conn_pool_mod.ConnPool) void {
+        self.pool = p;
+    }
+
     /// Resolve target, pick endpoint via balancer, dial, and perform H2 handshake.
     /// For managed channels (created with initManaged).
     pub fn connect(self: *Channel) ChannelError!void {
@@ -297,9 +308,10 @@ pub const Channel = struct {
 
     /// Returns whether the channel is in a state that requires reconnection.
     pub fn needsReconnect(self: *const Channel) bool {
+        const conn_state = if (self.pooled_conn) |pc| pc.client.conn.state else self.client.conn.state;
         return self.channel_state == .disconnected or
-            self.client.conn.state == .goaway_received or
-            self.client.conn.state == .closed;
+            conn_state == .goaway_received or
+            conn_state == .closed;
     }
 
     pub fn getState(self: *const Channel) ChannelState {
@@ -408,9 +420,27 @@ pub const Channel = struct {
     }
 
     fn autoConnect(self: *Channel) ChannelError!void {
+        if (self.pool) |p| {
+            if (self.pooled_conn != null and self.channel_state == .connected) return;
+            // Previous conn was marked failed — need a fresh one
+            if (self.pooled_conn) |pc| {
+                p.markFailed(pc);
+                self.pooled_conn = null;
+            }
+            const pc = p.acquire() catch return ChannelError.ConnectionFailed;
+            self.pooled_conn = pc;
+            self.channel_state = .connected;
+            return;
+        }
         if (self.channel_state != .connected and self.isManaged()) {
             try self.connect();
         }
+    }
+
+    /// Get the active H2 client — either from pool or owned.
+    fn activeClient(self: *Channel) *h2_client.Client {
+        if (self.pooled_conn) |pc| return &pc.client;
+        return &self.client;
     }
 
     /// Check keepalive state before an RPC. If a ping is outstanding and timed out,
@@ -444,7 +474,7 @@ pub const Channel = struct {
         const interval_ns: i128 = @as(i128, self.keepalive.interval_ms) * 1_000_000;
         if (since_activity >= interval_ns) {
             const ping_data: [8]u8 = .{ 'k', 'e', 'e', 'p', 'a', 'l', 'v', 'e' };
-            self.client.conn.sendPing(ping_data) catch {
+            self.activeClient().conn.sendPing(ping_data) catch {
                 self.channel_state = .disconnected;
                 return;
             };
@@ -457,6 +487,16 @@ pub const Channel = struct {
     fn recordActivity(self: *Channel) void {
         self.last_activity_ns = std.time.nanoTimestamp();
         self.ping_outstanding = false;
+    }
+
+    /// Release the currently held pooled connection back to the pool.
+    fn releasePooledConn(self: *Channel) void {
+        if (self.pool) |p| {
+            if (self.pooled_conn) |pc| {
+                p.release(pc);
+                self.pooled_conn = null;
+            }
+        }
     }
 
     fn unaryAttempt(
@@ -480,7 +520,8 @@ pub const Channel = struct {
 
         if (isDeadlineExceeded(deadline)) return ChannelError.DeadlineExceeded;
 
-        const handle = self.client.request(
+        const client = self.activeClient();
+        const handle = client.request(
             .POST,
             method,
             self.authority,
@@ -493,7 +534,7 @@ pub const Channel = struct {
         var resp_headers: [32]h2_hpack.HeaderField = undefined;
         var decode_buf: [8192]u8 = undefined;
 
-        const resp = self.client.recvResponse(
+        const resp = client.recvResponse(
             handle,
             &resp_headers,
             &decode_buf,
@@ -557,7 +598,8 @@ pub const Channel = struct {
 
         const headers = try buildGrpcHeaders(opts.metadata, opts.timeout_ms);
 
-        const handle = self.client.request(
+        const client = self.activeClient();
+        const handle = client.request(
             .POST,
             self.current_method,
             self.authority,
@@ -566,7 +608,7 @@ pub const Channel = struct {
         ) catch |e| return self.mapAndTrackError(e);
 
         return StreamHandle{
-            .client = &self.client,
+            .client = client,
             .handle = handle,
             .max_recv_message_size = opts.max_recv_message_size,
             .max_send_message_size = opts.max_send_message_size,
@@ -611,7 +653,8 @@ pub const Channel = struct {
         if (self.channel_state == .disconnected) try self.autoConnect();
         const headers = try buildGrpcHeaders(opts.metadata, opts.timeout_ms);
 
-        const handle = self.client.request(
+        const client = self.activeClient();
+        const handle = client.request(
             .POST,
             self.current_method,
             self.authority,
@@ -620,7 +663,7 @@ pub const Channel = struct {
         ) catch |e| return self.mapAndTrackError(e);
 
         return StreamHandle{
-            .client = &self.client,
+            .client = client,
             .handle = handle,
             .max_recv_message_size = opts.max_recv_message_size,
             .max_send_message_size = opts.max_send_message_size,
@@ -679,8 +722,11 @@ pub const Channel = struct {
     }
 
     pub fn close(self: *Channel) void {
-        self.client.close();
-        self.client.deinit();
+        self.releasePooledConn();
+        if (self.pool == null) {
+            self.client.close();
+            self.client.deinit();
+        }
         if (self.active_dial) |ad| {
             ad.close();
             self.active_dial = null;
@@ -760,8 +806,23 @@ pub const Channel = struct {
     fn mapAndTrackError(self: *Channel, e: h2_client.ClientError) ChannelError {
         const err = mapClientError(e);
         switch (err) {
-            ChannelError.IoError, ChannelError.ConnectionClosed, ChannelError.GoawayReceived, ChannelError.ConnectionFailed => {
+            ChannelError.GoawayReceived => {
                 self.channel_state = .disconnected;
+                if (self.pool) |p| {
+                    if (self.pooled_conn) |pc| {
+                        p.markDraining(pc);
+                        self.pooled_conn = null;
+                    }
+                }
+            },
+            ChannelError.IoError, ChannelError.ConnectionClosed, ChannelError.ConnectionFailed => {
+                self.channel_state = .disconnected;
+                if (self.pool) |p| {
+                    if (self.pooled_conn) |pc| {
+                        p.markFailed(pc);
+                        self.pooled_conn = null;
+                    }
+                }
             },
             else => {},
         }
@@ -2046,4 +2107,109 @@ test "keepalive: recordActivity resets state" {
     ch.recordActivity();
     try std.testing.expect(!ch.ping_outstanding);
     try std.testing.expect(ch.last_activity_ns > 0);
+}
+
+test "channel: GOAWAY marks pooled conn as draining not failed" {
+    const allocator = std.testing.allocator;
+
+    var server_data = std.ArrayListUnmanaged(u8){};
+    defer server_data.deinit(allocator);
+    try buildServerPreface(allocator, &server_data);
+
+    var pipe = TestPipe.init(allocator, server_data.items);
+    defer pipe.deinit();
+
+    var ch = Channel.init(allocator, pipe.reader(), pipe.writer(), "test.example.com", .{});
+    try ch.handshake();
+
+    // Create a fake pool and pooled conn
+    var pool = conn_pool_mod.ConnPool.init(
+        allocator,
+        .{},
+        .{},
+        .{ .context = undefined, .dialFn = undefined },
+        .{ .address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080) },
+        "localhost",
+    );
+    defer pool.deinit();
+
+    const now = std.time.nanoTimestamp();
+    pool.conns[0] = .{
+        .client = undefined,
+        .dial_result = undefined,
+        .state = .active,
+        .active_streams = 3,
+        .created_ns = now,
+        .last_used_ns = now,
+        .id = 0,
+    };
+    pool.conn_count = 1;
+
+    ch.pool = &pool;
+    ch.pooled_conn = &(pool.conns[0].?);
+
+    // Simulate GOAWAY error handling
+    const err = ch.mapAndTrackError(h2_client.ClientError.GoawayReceived);
+    try std.testing.expectEqual(ChannelError.GoawayReceived, err);
+
+    // Pooled conn should be draining, not closed
+    try std.testing.expectEqual(conn_pool_mod.ConnState.draining, pool.conns[0].?.state);
+    try std.testing.expect(ch.pooled_conn == null);
+    try std.testing.expectEqual(ChannelState.disconnected, ch.channel_state);
+
+    // Clean up
+    pool.conns[0] = null;
+    pool.conn_count = 0;
+    ch.pool = null;
+}
+
+test "channel: IO error marks pooled conn as failed" {
+    const allocator = std.testing.allocator;
+
+    var server_data = std.ArrayListUnmanaged(u8){};
+    defer server_data.deinit(allocator);
+    try buildServerPreface(allocator, &server_data);
+
+    var pipe = TestPipe.init(allocator, server_data.items);
+    defer pipe.deinit();
+
+    var ch = Channel.init(allocator, pipe.reader(), pipe.writer(), "test.example.com", .{});
+    try ch.handshake();
+
+    var pool = conn_pool_mod.ConnPool.init(
+        allocator,
+        .{},
+        .{},
+        .{ .context = undefined, .dialFn = undefined },
+        .{ .address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080) },
+        "localhost",
+    );
+    defer pool.deinit();
+
+    const now = std.time.nanoTimestamp();
+    pool.conns[0] = .{
+        .client = undefined,
+        .dial_result = undefined,
+        .state = .active,
+        .active_streams = 1,
+        .created_ns = now,
+        .last_used_ns = now,
+        .id = 0,
+    };
+    pool.conn_count = 1;
+
+    ch.pool = &pool;
+    ch.pooled_conn = &(pool.conns[0].?);
+
+    // Simulate IO error
+    const err = ch.mapAndTrackError(h2_client.ClientError.IoError);
+    try std.testing.expectEqual(ChannelError.IoError, err);
+
+    // Should be closed (hard failure), not draining
+    try std.testing.expectEqual(conn_pool_mod.ConnState.closed, pool.conns[0].?.state);
+    try std.testing.expect(ch.pooled_conn == null);
+
+    pool.conns[0] = null;
+    pool.conn_count = 0;
+    ch.pool = null;
 }

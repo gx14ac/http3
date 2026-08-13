@@ -112,6 +112,17 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run fuzz tests");
     fuzz_step.dependOn(&run_fuzz.step);
 
+    // QUIC tests
+    const quic_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/quic/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const quic_tests = b.addTest(.{
+        .root_module = quic_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(quic_tests).step);
+
     // Integration tests (requires external gRPC server on localhost:50051)
     const integration_test_mod = b.createModule(.{
         .root_source_file = b.path("test/integration/smoke_test.zig"),

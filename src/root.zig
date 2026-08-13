@@ -17,6 +17,7 @@ pub const io = struct {
 };
 
 pub const grpc = @import("grpc/root.zig");
+pub const quic = @import("quic/root.zig");
 
 test {
     _ = h2.frame;
@@ -30,4 +31,5 @@ test {
     _ = io.tcp;
     _ = io.tls;
     _ = grpc;
+    _ = quic;
 }

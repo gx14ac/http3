@@ -29,6 +29,7 @@ pub const HealthCheckResult = struct {
 pub const HealthError = error{
     RpcFailed,
     InvalidResponse,
+    StreamEnded,
 };
 
 /// Client for the grpc.health.v1.Health service.
@@ -70,6 +71,43 @@ pub const HealthClient = struct {
         const result = self.check(service) catch return false;
         return result.status == .serving;
     }
+
+    /// Start a server-streaming Watch RPC for health status changes.
+    /// Returns a HealthWatcher that yields ServingStatus updates.
+    pub fn watch(self: *HealthClient, service: []const u8) HealthError!HealthWatcher {
+        var request_buf: [256]u8 = undefined;
+        const request = encodeHealthCheckRequest(service, &request_buf) orelse
+            return HealthError.InvalidResponse;
+
+        const stream = self.channel.serverStream(
+            "/grpc.health.v1.Health/Watch",
+            request,
+            .{},
+        ) catch return HealthError.RpcFailed;
+
+        return HealthWatcher{ .stream = stream };
+    }
+};
+
+/// Server-streaming watcher for health status changes.
+/// Call next() to block until the next status update arrives.
+pub const HealthWatcher = struct {
+    stream: channel_mod.StreamHandle,
+
+    /// Receive the next health status update.
+    /// Returns null when the stream ends normally.
+    pub fn next(self: *HealthWatcher) HealthError!?ServingStatus {
+        var buf: [64]u8 = undefined;
+        const data = self.stream.recv(&buf) catch return HealthError.RpcFailed;
+        if (data == null) return null;
+
+        return decodeHealthCheckResponse(data.?) orelse HealthError.InvalidResponse;
+    }
+
+    /// Close the watcher and release resources.
+    pub fn deinit(self: *HealthWatcher) void {
+        self.stream.deinit();
+    }
 };
 
 // ─── Protobuf wire format (grpc.health.v1) ───
@@ -77,7 +115,7 @@ pub const HealthClient = struct {
 /// Encode HealthCheckRequest: field 1 (string service).
 /// Wire format: tag(0x0A) + varint(len) + bytes.
 /// Empty service → empty message (0 bytes).
-fn encodeHealthCheckRequest(service: []const u8, buf: []u8) ?[]const u8 {
+pub fn encodeHealthCheckRequest(service: []const u8, buf: []u8) ?[]const u8 {
     if (service.len == 0) {
         return buf[0..0];
     }
@@ -95,7 +133,7 @@ fn encodeHealthCheckRequest(service: []const u8, buf: []u8) ?[]const u8 {
 /// Decode HealthCheckResponse: field 1 (enum ServingStatus).
 /// Wire format: tag(0x08) + varint(value).
 /// Empty response → UNKNOWN (default value).
-fn decodeHealthCheckResponse(data: []const u8) ?ServingStatus {
+pub fn decodeHealthCheckResponse(data: []const u8) ?ServingStatus {
     if (data.len == 0) return .unknown;
 
     var pos: usize = 0;

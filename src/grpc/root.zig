@@ -40,7 +40,32 @@ pub const TlsDialer = tls_dialer.TlsDialer;
 
 pub const health = @import("health.zig");
 pub const HealthClient = health.HealthClient;
+pub const HealthWatcher = health.HealthWatcher;
 pub const ServingStatus = health.ServingStatus;
+
+pub const conn_pool = @import("conn_pool.zig");
+pub const ConnPool = conn_pool.ConnPool;
+pub const PooledConn = conn_pool.PooledConn;
+pub const PoolConfig = conn_pool.PoolConfig;
+pub const PoolError = conn_pool.PoolError;
+
+pub const h3_channel = @import("h3_channel.zig");
+pub const H3Channel = h3_channel.H3Channel;
+pub const H3ChannelError = h3_channel.H3ChannelError;
+pub const H3GrpcStream = h3_channel.H3GrpcStream;
+pub const H3UnaryInterceptor = h3_channel.H3UnaryInterceptor;
+pub const H3InterceptorChain = h3_channel.H3InterceptorChain;
+pub const H3Invoker = h3_channel.H3Invoker;
+pub const H3UnaryCallInfo = h3_channel.H3UnaryCallInfo;
+pub const H3StreamInterceptor = h3_channel.H3StreamInterceptor;
+pub const H3StreamInterceptorChain = h3_channel.H3StreamInterceptorChain;
+pub const H3StreamInvoker = h3_channel.H3StreamInvoker;
+pub const H3StreamCallInfo = h3_channel.H3StreamCallInfo;
+pub const H3StreamType = h3_channel.H3StreamType;
+
+pub const h3_health = @import("h3_health.zig");
+pub const H3HealthClient = h3_health.H3HealthClient;
+pub const H3HealthWatcher = h3_health.H3HealthWatcher;
 
 pub const StreamInterceptor = stream_interceptor.StreamInterceptor;
 pub const StreamInterceptorChain = stream_interceptor.StreamInterceptorChain;
@@ -59,5 +84,9 @@ test {
     _ = dialer;
     _ = tls_dialer;
     _ = health;
+    _ = conn_pool;
+    _ = h3_channel;
+    _ = h3_health;
+    _ = @import("h3_e2e_test.zig");
     _ = @import("integration_test.zig");
 }
