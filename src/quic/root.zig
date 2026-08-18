@@ -164,6 +164,34 @@ pub const CubicCc = cubic.CubicCc;
 pub const CongestionAlgorithm = loss.CongestionAlgorithm;
 pub const CcState = loss.CcState;
 
+pub const ecn = @import("ecn.zig");
+pub const EcnCodepoint = ecn.EcnCodepoint;
+pub const EcnCounts = ecn.EcnCounts;
+pub const EcnValidator = ecn.EcnValidator;
+
+pub const resumption = @import("resumption.zig");
+pub const SessionTicket = resumption.SessionTicket;
+pub const TicketStore = resumption.TicketStore;
+pub const EarlyKeys = resumption.EarlyKeys;
+
+pub const reconnect = @import("reconnect.zig");
+pub const ReconnectManager = reconnect.ReconnectManager;
+pub const ReconnectConfig = reconnect.ReconnectManager.Config;
+
+pub const zero_rtt = @import("zero_rtt.zig");
+pub const ZeroRttClientHelloBuilder = zero_rtt.ZeroRttClientHelloBuilder;
+
+pub const server_handshake = @import("server_handshake.zig");
+pub const server = @import("server.zig");
+pub const QuicServer = server.QuicServer;
+pub const ServerConn = server.ServerConn;
+pub const ServerEvent = server.ServerEvent;
+
+pub const h3_server = @import("h3_server.zig");
+pub const H3Server = h3_server.H3Server;
+pub const H3Request = h3_server.H3Request;
+pub const H3ServerEvent = h3_server.H3ServerEvent;
+
 pub const qpack_dynamic = @import("qpack_dynamic.zig");
 pub const DynamicTable = qpack_dynamic.DynamicTable;
 pub const DynamicEncoder = qpack_dynamic.DynamicEncoder;
@@ -225,9 +253,19 @@ test {
     _ = retransmit;
     _ = migration;
     _ = cubic;
+    _ = ecn;
+    _ = resumption;
+    _ = zero_rtt;
+    _ = reconnect;
+    _ = server_handshake;
+    _ = server;
+    _ = @import("server_e2e_test.zig");
+    _ = h3_server;
+    _ = @import("h3_e2e_test.zig");
     _ = qpack_dynamic;
     _ = client;
     _ = h3_client;
     _ = h3_pool;
     _ = e2e_test;
+    _ = @import("interop_test.zig");
 }
