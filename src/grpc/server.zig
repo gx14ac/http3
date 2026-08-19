@@ -22,6 +22,11 @@ pub const GrpcServerError = error{
     DeadlineExceeded,
 };
 
+pub const RequestMetadata = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 pub const GrpcRequest = struct {
     path_buf: [1024]u8,
     path_len: usize,
@@ -36,8 +41,11 @@ pub const GrpcRequest = struct {
     conn_idx: usize,
     stream_id: u62,
     deadline_ns: ?i128,
+    headers: [MAX_METADATA]qpack.HeaderField,
+    header_count: usize,
 
     pub const MAX_PAYLOAD = 16384;
+    pub const MAX_METADATA = 16;
 
     pub fn path(self: *const GrpcRequest) []const u8 {
         return self.path_buf[0..self.path_len];
@@ -69,6 +77,19 @@ pub const GrpcRequest = struct {
         const now: i128 = std.time.nanoTimestamp();
         if (now >= dl) return 0;
         return @intCast(@divFloor(dl - now, 1_000_000));
+    }
+
+    /// Get all application metadata headers (excludes pseudo-headers and well-known gRPC headers).
+    pub fn metadata(self: *const GrpcRequest) []const qpack.HeaderField {
+        return self.headers[0..self.header_count];
+    }
+
+    /// Look up a specific metadata header by key. Returns the value or null.
+    pub fn getHeader(self: *const GrpcRequest, key: []const u8) ?[]const u8 {
+        for (self.headers[0..self.header_count]) |h| {
+            if (std.mem.eql(u8, h.name, key)) return h.value;
+        }
+        return null;
     }
 };
 
@@ -422,12 +443,24 @@ pub const GrpcServer = struct {
         req.conn_idx = h3_req.conn_idx;
         req.stream_id = h3_req.stream_id;
 
-        // Parse grpc-timeout header → compute absolute deadline
+        // Parse grpc-timeout header and copy application metadata
         req.deadline_ns = null;
+        req.header_count = 0;
         for (h3_req.headers[0..h3_req.header_count]) |h| {
             if (std.mem.eql(u8, h.name, "grpc-timeout")) {
                 req.deadline_ns = computeDeadlineFromTimeout(h.value);
-                break;
+            }
+            // Copy non-pseudo, non-well-known headers as metadata
+            if (h.name.len > 0 and h.name[0] != ':' and
+                !std.mem.eql(u8, h.name, "content-type") and
+                !std.mem.eql(u8, h.name, "te") and
+                !std.mem.eql(u8, h.name, "grpc-timeout") and
+                !std.mem.eql(u8, h.name, "grpc-encoding"))
+            {
+                if (req.header_count < GrpcRequest.MAX_METADATA) {
+                    req.headers[req.header_count] = h;
+                    req.header_count += 1;
+                }
             }
         }
 
@@ -671,4 +704,28 @@ test "GrpcServer: activeConnectionCount initially zero" {
     var server = try GrpcServer.init(addr, .{});
     defer server.deinit();
     try std.testing.expectEqual(@as(usize, 0), server.activeConnectionCount());
+}
+
+test "GrpcRequest: getHeader returns metadata value" {
+    var req: GrpcRequest = undefined;
+    req.header_count = 2;
+    req.headers[0] = .{ .name = "authorization", .value = "Bearer token123" };
+    req.headers[1] = .{ .name = "x-request-id", .value = "abc-def" };
+
+    try std.testing.expectEqualStrings("Bearer token123", req.getHeader("authorization").?);
+    try std.testing.expectEqualStrings("abc-def", req.getHeader("x-request-id").?);
+    try std.testing.expect(req.getHeader("missing") == null);
+}
+
+test "GrpcRequest: metadata returns all headers" {
+    var req: GrpcRequest = undefined;
+    req.header_count = 3;
+    req.headers[0] = .{ .name = "x-trace-id", .value = "trace-1" };
+    req.headers[1] = .{ .name = "x-user-id", .value = "user-42" };
+    req.headers[2] = .{ .name = "authorization", .value = "Bearer xyz" };
+
+    const md = req.metadata();
+    try std.testing.expectEqual(@as(usize, 3), md.len);
+    try std.testing.expectEqualStrings("x-trace-id", md[0].name);
+    try std.testing.expectEqualStrings("trace-1", md[0].value);
 }

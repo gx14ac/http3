@@ -77,6 +77,7 @@ pub const ServiceHandler = grpc_server.ServiceHandler;
 pub const ServiceRoute = grpc_server.ServiceRoute;
 pub const ServerStream = grpc_server.ServerStream;
 pub const GrpcStreamMessage = grpc_server.GrpcStreamMessage;
+pub const RequestMetadata = grpc_server.RequestMetadata;
 
 pub const StreamInterceptor = stream_interceptor.StreamInterceptor;
 pub const StreamInterceptorChain = stream_interceptor.StreamInterceptorChain;
