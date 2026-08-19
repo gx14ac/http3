@@ -104,7 +104,7 @@ pub const QuicServer = struct {
     pub const MAX_CONNS = 16;
 
     pub const Config = struct {
-        cert_der: []const u8 = "QUIC-TEST-CERT",
+        cert_der: ?[]const u8 = null,
     };
 
     pub fn init(bind_addr: std.net.Address, config: Config) ServerError!QuicServer {
@@ -123,16 +123,24 @@ pub const QuicServer = struct {
         posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen()) catch
             return ServerError.BindFailed;
 
+        const signing_key = crypto.sign.Ed25519.KeyPair.generate();
+
         var cert_buf: [1024]u8 = undefined;
-        const cert_len = @min(config.cert_der.len, 1024);
-        @memcpy(cert_buf[0..cert_len], config.cert_der[0..cert_len]);
+        var cert_len: usize = 0;
+        if (config.cert_der) |provided_cert| {
+            cert_len = @min(provided_cert.len, 1024);
+            @memcpy(cert_buf[0..cert_len], provided_cert[0..cert_len]);
+        } else {
+            // Generate self-signed X.509 certificate from the signing key
+            cert_len = server_hs.buildSelfSignedCertDer(&cert_buf, signing_key) orelse 0;
+        }
 
         return .{
             .fd = fd,
             .bind_addr = bind_addr,
             .conns = undefined,
             .conn_count = 0,
-            .signing_key = crypto.sign.Ed25519.KeyPair.generate(),
+            .signing_key = signing_key,
             .cert_der = cert_buf,
             .cert_der_len = cert_len,
             .recv_stream_buf = undefined,

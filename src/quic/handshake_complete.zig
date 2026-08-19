@@ -15,6 +15,7 @@ pub const HandshakeCompleteError = error{
     MissingCertificateVerify,
     MissingFinished,
     FinishedVerificationFailed,
+    CertificateVerifyFailed,
     UnexpectedMessage,
     AlpnMismatch,
     TruncatedData,
@@ -81,6 +82,9 @@ pub fn processServerHandshakeFlight(
     if (next.msg.msg_type != .certificate)
         return HandshakeCompleteError.MissingCertificate;
 
+    // Extract first certificate DER for CertificateVerify validation
+    const cert_der = tls_messages.extractFirstCertDer(next.msg.payload);
+
     transcript.update(crypto_data[pos..][0..next.consumed]);
     pos += next.consumed;
 
@@ -89,6 +93,16 @@ pub fn processServerHandshakeFlight(
         return HandshakeCompleteError.MissingCertificateVerify;
     if (cv_parsed.msg.msg_type != .certificate_verify)
         return HandshakeCompleteError.MissingCertificateVerify;
+
+    // Verify CertificateVerify signature (RFC 8446 §4.4.3)
+    // Transcript hash is computed over messages up to but not including CertificateVerify
+    if (cert_der) |der| {
+        const cv_msg = tls_messages.parseCertificateVerify(cv_parsed.msg.payload) orelse
+            return HandshakeCompleteError.MissingCertificateVerify;
+        const transcript_before_cv = transcript.current();
+        tls_messages.verifyCertificateVerify(transcript_before_cv, der, cv_msg) catch
+            return HandshakeCompleteError.CertificateVerifyFailed;
+    }
 
     transcript.update(crypto_data[pos..][0..cv_parsed.consumed]);
     pos += cv_parsed.consumed;

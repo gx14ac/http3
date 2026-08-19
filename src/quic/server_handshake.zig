@@ -311,6 +311,137 @@ fn writeTransportParam(buf: []u8, param_id: u64, value: u64) ?usize {
     return pos;
 }
 
+/// Build a minimal self-signed X.509 DER certificate for Ed25519.
+/// Returns the DER bytes written to `out`. This certificate is minimal but parseable
+/// by std.crypto.Certificate.parse(), containing the Ed25519 public key.
+pub fn buildSelfSignedCertDer(out: []u8, key_pair: crypto.sign.Ed25519.KeyPair) ?usize {
+    const pub_key = key_pair.public_key.bytes;
+
+    // Minimal X.509 v3 structure (DER encoded):
+    // SEQUENCE (Certificate) {
+    //   SEQUENCE (TBSCertificate) {
+    //     [0] EXPLICIT INTEGER 2 (version v3)
+    //     INTEGER 1 (serialNumber)
+    //     SEQUENCE { OID 1.3.101.112 (Ed25519) } (signature algorithm)
+    //     SEQUENCE { SET { SEQUENCE { OID 2.5.4.3, UTF8String "localhost" } } } (issuer)
+    //     SEQUENCE { UTCTime "250101000000Z", UTCTime "350101000000Z" } (validity)
+    //     SEQUENCE { SET { SEQUENCE { OID 2.5.4.3, UTF8String "localhost" } } } (subject)
+    //     SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING <pub_key> } (subjectPublicKeyInfo)
+    //   }
+    //   SEQUENCE { OID 1.3.101.112 } (signatureAlgorithm)
+    //   BIT STRING <signature>
+    // }
+
+    // Pre-built DER fragments (everything except the public key and signature)
+    const ed25519_oid = [_]u8{ 0x06, 0x03, 0x2B, 0x65, 0x70 }; // OID 1.3.101.112
+    const cn_oid = [_]u8{ 0x06, 0x03, 0x55, 0x04, 0x03 }; // OID 2.5.4.3 (commonName)
+    const cn_value = [_]u8{ 0x0C, 0x09, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't' }; // UTF8String "localhost"
+
+    // Build issuer/subject: SEQUENCE { SET { SEQUENCE { cn_oid, cn_value } } }
+    const cn_seq_len = cn_oid.len + cn_value.len;
+    const cn_seq = [_]u8{ 0x30, cn_seq_len } ++ cn_oid ++ cn_value;
+    const cn_set = [_]u8{ 0x31, cn_seq.len } ++ cn_seq;
+    const name = [_]u8{ 0x30, cn_set.len } ++ cn_set;
+
+    // Validity: SEQUENCE { UTCTime "250101000000Z", UTCTime "350101000000Z" }
+    const not_before = [_]u8{ 0x17, 0x0D } ++ "250101000000Z".*;
+    const not_after = [_]u8{ 0x17, 0x0D } ++ "350101000000Z".*;
+    const validity = [_]u8{ 0x30, not_before.len + not_after.len } ++ not_before ++ not_after;
+
+    // SubjectPublicKeyInfo: SEQUENCE { SEQUENCE { ed25519_oid }, BIT STRING(pub_key) }
+    const algo_seq = [_]u8{ 0x30, ed25519_oid.len } ++ ed25519_oid;
+    const bit_string_hdr = [_]u8{ 0x03, 33, 0x00 }; // BIT STRING: 33 bytes (1 unused_bits + 32 pub_key)
+    const spki_inner_len = algo_seq.len + bit_string_hdr.len + 32;
+    const spki_hdr = [_]u8{ 0x30, @intCast(spki_inner_len) };
+
+    // Version: [0] EXPLICIT { INTEGER 2 }
+    const version = [_]u8{ 0xA0, 0x03, 0x02, 0x01, 0x02 };
+    // Serial number: INTEGER 1
+    const serial = [_]u8{ 0x02, 0x01, 0x01 };
+    // Signature algorithm in TBS: SEQUENCE { ed25519_oid }
+    const sig_algo = [_]u8{ 0x30, ed25519_oid.len } ++ ed25519_oid;
+
+    // TBSCertificate length
+    const tbs_content_len = version.len + serial.len + sig_algo.len + name.len + validity.len + name.len + spki_hdr.len + algo_seq.len + bit_string_hdr.len + 32;
+
+    // Build TBS
+    var pos: usize = 0;
+    if (out.len < 4 + tbs_content_len + 200) return null; // rough check
+
+    // Outer SEQUENCE placeholder (fill length later)
+    const outer_start = pos;
+    out[pos] = 0x30;
+    pos += 1;
+    // We'll use 2-byte length encoding (0x82 + 2 bytes)
+    out[pos] = 0x82;
+    pos += 3; // skip 2 bytes for length, fill later
+
+    // TBSCertificate SEQUENCE
+    const tbs_start = pos;
+    out[pos] = 0x30;
+    pos += 1;
+    if (tbs_content_len < 128) {
+        out[pos] = @intCast(tbs_content_len);
+        pos += 1;
+    } else {
+        out[pos] = 0x81;
+        pos += 1;
+        out[pos] = @intCast(tbs_content_len);
+        pos += 1;
+    }
+    const tbs_body_start = pos;
+
+    @memcpy(out[pos..][0..version.len], &version);
+    pos += version.len;
+    @memcpy(out[pos..][0..serial.len], &serial);
+    pos += serial.len;
+    @memcpy(out[pos..][0..sig_algo.len], &sig_algo);
+    pos += sig_algo.len;
+    @memcpy(out[pos..][0..name.len], &name);
+    pos += name.len;
+    @memcpy(out[pos..][0..validity.len], &validity);
+    pos += validity.len;
+    @memcpy(out[pos..][0..name.len], &name);
+    pos += name.len;
+    @memcpy(out[pos..][0..spki_hdr.len], &spki_hdr);
+    pos += spki_hdr.len;
+    @memcpy(out[pos..][0..algo_seq.len], &algo_seq);
+    pos += algo_seq.len;
+    @memcpy(out[pos..][0..bit_string_hdr.len], &bit_string_hdr);
+    pos += bit_string_hdr.len;
+    @memcpy(out[pos..][0..32], &pub_key);
+    pos += 32;
+
+    _ = tbs_body_start;
+    const tbs_end = pos;
+    const tbs_bytes = out[tbs_start..tbs_end];
+
+    // signatureAlgorithm SEQUENCE { ed25519_oid }
+    @memcpy(out[pos..][0..sig_algo.len], &sig_algo);
+    pos += sig_algo.len;
+
+    // Sign the TBS
+    const sig = key_pair.sign(tbs_bytes, null) catch return null;
+    const sig_bytes = sig.toBytes();
+
+    // BIT STRING for signature: 0x03 + length + 0x00 (unused bits) + signature
+    out[pos] = 0x03;
+    pos += 1;
+    out[pos] = 65; // 1 + 64
+    pos += 1;
+    out[pos] = 0x00; // unused bits
+    pos += 1;
+    @memcpy(out[pos..][0..64], &sig_bytes);
+    pos += 64;
+
+    // Fill outer SEQUENCE length
+    const outer_content_len = pos - (outer_start + 4); // content after the 4-byte header (0x30, 0x82, HI, LO)
+    out[outer_start + 2] = @intCast((outer_content_len >> 8) & 0xFF);
+    out[outer_start + 3] = @intCast(outer_content_len & 0xFF);
+
+    return pos;
+}
+
 /// Build a minimal Certificate message (self-signed Ed25519 certificate).
 /// For testing purposes — uses a raw public key in a minimal X.509-like wrapper.
 pub fn buildCertificateMsg(buf: []u8, cert_der: []const u8) ?usize {

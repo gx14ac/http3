@@ -2,6 +2,8 @@ const std = @import("std");
 const quic_crypto = @import("crypto.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha384 = std.crypto.hash.sha2.Sha384;
+const Certificate = std.crypto.Certificate;
 
 /// TLS 1.3 Handshake message types (RFC 8446 §4).
 pub const HandshakeType = enum(u8) {
@@ -197,6 +199,166 @@ pub fn buildClientFinishedMsg(verify_data: [32]u8, buf: []u8) ?usize {
     buf[3] = 32;
     @memcpy(buf[4..36], &verify_data);
     return 36;
+}
+
+/// TLS 1.3 SignatureScheme (RFC 8446 §4.2.3).
+pub const SignatureScheme = enum(u16) {
+    ecdsa_secp256r1_sha256 = 0x0403,
+    ecdsa_secp384r1_sha384 = 0x0503,
+    rsa_pss_rsae_sha256 = 0x0804,
+    rsa_pss_rsae_sha384 = 0x0805,
+    rsa_pss_rsae_sha512 = 0x0806,
+    ed25519 = 0x0807,
+    rsa_pkcs1_sha256 = 0x0401,
+    rsa_pkcs1_sha384 = 0x0501,
+    rsa_pkcs1_sha512 = 0x0601,
+    _,
+};
+
+/// Parsed CertificateVerify payload.
+pub const CertificateVerifyMsg = struct {
+    scheme: SignatureScheme,
+    signature: []const u8,
+};
+
+/// Parse CertificateVerify message payload (RFC 8446 §4.4.3).
+/// Payload layout: signature_scheme(2) + signature_length(2) + signature(N).
+pub fn parseCertificateVerify(payload: []const u8) ?CertificateVerifyMsg {
+    if (payload.len < 4) return null;
+    const scheme: SignatureScheme = @enumFromInt(std.mem.readInt(u16, payload[0..2], .big));
+    const sig_len: usize = std.mem.readInt(u16, payload[2..4], .big);
+    if (payload.len < 4 + sig_len) return null;
+    return .{
+        .scheme = scheme,
+        .signature = payload[4..][0..sig_len],
+    };
+}
+
+/// Extract the first certificate's DER bytes from a Certificate message payload.
+/// Returns null if the payload is malformed or has no certificates.
+pub fn extractFirstCertDer(payload: []const u8) ?[]const u8 {
+    if (payload.len < 1) return null;
+    const ctx_len: usize = payload[0];
+    var pos: usize = 1 + ctx_len;
+    if (payload.len < pos + 3) return null;
+    // certificate list length
+    pos += 3;
+    // first cert entry: cert_data_len(3) + cert_data
+    if (payload.len < pos + 3) return null;
+    const cert_data_len: usize = (@as(usize, payload[pos]) << 16) |
+        (@as(usize, payload[pos + 1]) << 8) |
+        payload[pos + 2];
+    pos += 3;
+    if (payload.len < pos + cert_data_len) return null;
+    return payload[pos..][0..cert_data_len];
+}
+
+pub const CertificateVerifyError = error{
+    InvalidSignature,
+    UnsupportedScheme,
+    InvalidCertificate,
+    CertificatePublicKeyInvalid,
+};
+
+/// Verify the server's CertificateVerify signature (RFC 8446 §4.4.3).
+/// transcript_hash: SHA-256 hash of all handshake messages up to (but not including) CertificateVerify.
+/// cert_der: DER-encoded X.509 certificate (first cert from the Certificate message).
+/// cv: parsed CertificateVerify message.
+pub fn verifyCertificateVerify(
+    transcript_hash: [32]u8,
+    cert_der: []const u8,
+    cv: CertificateVerifyMsg,
+) CertificateVerifyError!void {
+    // Parse X.509 certificate to extract public key
+    const cert = Certificate{ .buffer = cert_der, .index = @intCast(0) };
+    const parsed = cert.parse() catch return CertificateVerifyError.InvalidCertificate;
+    const pub_key = parsed.pubKey();
+    const pub_key_algo = parsed.pub_key_algo;
+
+    // Construct the content that was signed: 64 spaces + context string + 0x00 + transcript_hash
+    const context = "TLS 1.3, server CertificateVerify";
+    const content_len = 64 + context.len + 1 + 32;
+    var sign_content: [content_len]u8 = undefined;
+    @memset(sign_content[0..64], 0x20);
+    @memcpy(sign_content[64..][0..context.len], context);
+    sign_content[64 + context.len] = 0x00;
+    @memcpy(sign_content[64 + context.len + 1 ..][0..32], &transcript_hash);
+
+    switch (cv.scheme) {
+        .ed25519 => {
+            if (pub_key_algo != .curveEd25519) return CertificateVerifyError.InvalidSignature;
+            const Ed25519 = std.crypto.sign.Ed25519;
+            if (cv.signature.len != Ed25519.Signature.encoded_length) return CertificateVerifyError.InvalidSignature;
+            if (pub_key.len != Ed25519.PublicKey.encoded_length) return CertificateVerifyError.CertificatePublicKeyInvalid;
+            const sig = Ed25519.Signature.fromBytes(cv.signature[0..Ed25519.Signature.encoded_length].*);
+            const key = Ed25519.PublicKey.fromBytes(pub_key[0..Ed25519.PublicKey.encoded_length].*) catch
+                return CertificateVerifyError.CertificatePublicKeyInvalid;
+            sig.verify(&sign_content, key) catch return CertificateVerifyError.InvalidSignature;
+        },
+        .ecdsa_secp256r1_sha256 => {
+            if (pub_key_algo != .X9_62_id_ecPublicKey) return CertificateVerifyError.InvalidSignature;
+            const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+            const sig = EcdsaP256Sha256.Signature.fromDer(cv.signature) catch
+                return CertificateVerifyError.InvalidSignature;
+            const key = EcdsaP256Sha256.PublicKey.fromSec1(pub_key) catch
+                return CertificateVerifyError.CertificatePublicKeyInvalid;
+            sig.verify(&sign_content, key) catch return CertificateVerifyError.InvalidSignature;
+        },
+        .ecdsa_secp384r1_sha384 => {
+            if (pub_key_algo != .X9_62_id_ecPublicKey) return CertificateVerifyError.InvalidSignature;
+            const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+            const sig = EcdsaP384Sha384.Signature.fromDer(cv.signature) catch
+                return CertificateVerifyError.InvalidSignature;
+            const key = EcdsaP384Sha384.PublicKey.fromSec1(pub_key) catch
+                return CertificateVerifyError.CertificatePublicKeyInvalid;
+            sig.verify(&sign_content, key) catch return CertificateVerifyError.InvalidSignature;
+        },
+        .rsa_pss_rsae_sha256 => {
+            if (pub_key_algo != .rsaEncryption) return CertificateVerifyError.InvalidSignature;
+            verifyRsaPss(pub_key, cv.signature, &sign_content, .sha256) catch
+                return CertificateVerifyError.InvalidSignature;
+        },
+        .rsa_pss_rsae_sha384 => {
+            if (pub_key_algo != .rsaEncryption) return CertificateVerifyError.InvalidSignature;
+            verifyRsaPss(pub_key, cv.signature, &sign_content, .sha384) catch
+                return CertificateVerifyError.InvalidSignature;
+        },
+        .rsa_pss_rsae_sha512 => {
+            if (pub_key_algo != .rsaEncryption) return CertificateVerifyError.InvalidSignature;
+            verifyRsaPss(pub_key, cv.signature, &sign_content, .sha512) catch
+                return CertificateVerifyError.InvalidSignature;
+        },
+        else => return CertificateVerifyError.UnsupportedScheme,
+    }
+}
+
+const RsaHashType = enum { sha256, sha384, sha512 };
+
+fn verifyRsaPss(pub_key_der: []const u8, sig_bytes: []const u8, message: []const u8, hash_type: RsaHashType) !void {
+    const rsa = Certificate.rsa;
+    const components = try rsa.PublicKey.parseDer(pub_key_der);
+    const modulus = components.modulus;
+
+    switch (modulus.len) {
+        inline 128, 256, 384, 512 => |modulus_len| {
+            const key: rsa.PublicKey = try .fromBytes(components.exponent, modulus);
+            switch (hash_type) {
+                .sha256 => {
+                    const sig = rsa.PSSSignature.fromBytes(modulus_len, sig_bytes);
+                    try rsa.PSSSignature.verify(modulus_len, sig, message, key, Sha256);
+                },
+                .sha384 => {
+                    const sig = rsa.PSSSignature.fromBytes(modulus_len, sig_bytes);
+                    try rsa.PSSSignature.verify(modulus_len, sig, message, key, Sha384);
+                },
+                .sha512 => {
+                    const sig = rsa.PSSSignature.fromBytes(modulus_len, sig_bytes);
+                    try rsa.PSSSignature.verify(modulus_len, sig, message, key, std.crypto.hash.sha2.Sha512);
+                },
+            }
+        },
+        else => return error.TlsBadRsaSignatureBitCount,
+    }
 }
 
 /// Incremental transcript hash computation.
@@ -405,4 +567,60 @@ test "parseCertificate: single cert" {
     const cert = parseCertificate(&payload) orelse unreachable;
     try std.testing.expectEqual(@as(u8, 0), cert.certificate_request_context_len);
     try std.testing.expectEqual(@as(usize, 1), cert.cert_count);
+}
+
+test "parseCertificateVerify: valid parse" {
+    var payload: [68]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], 0x0807, .big); // ed25519
+    std.mem.writeInt(u16, payload[2..4], 64, .big); // sig_len = 64
+    @memset(payload[4..68], 0xAB); // fake signature
+
+    const cv = parseCertificateVerify(&payload) orelse unreachable;
+    try std.testing.expectEqual(SignatureScheme.ed25519, cv.scheme);
+    try std.testing.expectEqual(@as(usize, 64), cv.signature.len);
+}
+
+test "verifyCertificateVerify: Ed25519 roundtrip" {
+    const server_hs = @import("server_handshake.zig");
+    const Ed25519 = std.crypto.sign.Ed25519;
+
+    // Generate a key pair and build a valid self-signed cert
+    const kp = Ed25519.KeyPair.generate();
+    var cert_buf: [1024]u8 = undefined;
+    const cert_len = server_hs.buildSelfSignedCertDer(&cert_buf, kp) orelse unreachable;
+    const cert_der = cert_buf[0..cert_len];
+
+    // Build CertificateVerify (same as server would)
+    const transcript_hash = [_]u8{0x42} ** 32;
+    var cv_buf: [256]u8 = undefined;
+    const cv_total = server_hs.buildCertificateVerify(&cv_buf, transcript_hash, kp) orelse unreachable;
+
+    // Parse the CertificateVerify payload (skip type+length header = 4 bytes)
+    const cv_payload = cv_buf[4..cv_total];
+    const cv_msg = parseCertificateVerify(cv_payload) orelse unreachable;
+
+    // Verify should succeed
+    try verifyCertificateVerify(transcript_hash, cert_der, cv_msg);
+}
+
+test "verifyCertificateVerify: wrong transcript rejected" {
+    const server_hs = @import("server_handshake.zig");
+    const Ed25519 = std.crypto.sign.Ed25519;
+
+    const kp = Ed25519.KeyPair.generate();
+    var cert_buf: [1024]u8 = undefined;
+    const cert_len = server_hs.buildSelfSignedCertDer(&cert_buf, kp) orelse unreachable;
+    const cert_der = cert_buf[0..cert_len];
+
+    const transcript_hash = [_]u8{0x42} ** 32;
+    var cv_buf: [256]u8 = undefined;
+    const cv_total = server_hs.buildCertificateVerify(&cv_buf, transcript_hash, kp) orelse unreachable;
+
+    const cv_payload = cv_buf[4..cv_total];
+    const cv_msg = parseCertificateVerify(cv_payload) orelse unreachable;
+
+    // Use wrong transcript — should fail
+    const wrong_transcript = [_]u8{0xFF} ** 32;
+    const result = verifyCertificateVerify(wrong_transcript, cert_der, cv_msg);
+    try std.testing.expectError(CertificateVerifyError.InvalidSignature, result);
 }
