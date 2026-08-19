@@ -132,6 +132,7 @@ pub const GrpcClient = struct {
                     .goaway => {},
                     .peer_closing => {},
                     .close_resend => {},
+                    .new_session_ticket => {},
                     .none => {},
                 }
 

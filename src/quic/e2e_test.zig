@@ -494,6 +494,7 @@ test "E2E: Full handshake via Connection Manager" {
                 .goaway => {},
                 .peer_closing => {},
                 .close_resend => {},
+                .new_session_ticket => {},
                 .none => {},
             }
 
