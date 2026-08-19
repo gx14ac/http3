@@ -95,14 +95,12 @@ pub fn processServerHandshakeFlight(
         return HandshakeCompleteError.MissingCertificateVerify;
 
     // Verify CertificateVerify signature (RFC 8446 §4.4.3)
-    // Transcript hash is computed over messages up to but not including CertificateVerify
-    if (cert_der) |der| {
-        const cv_msg = tls_messages.parseCertificateVerify(cv_parsed.msg.payload) orelse
-            return HandshakeCompleteError.MissingCertificateVerify;
-        const transcript_before_cv = transcript.current();
-        tls_messages.verifyCertificateVerify(transcript_before_cv, der, cv_msg) catch
-            return HandshakeCompleteError.CertificateVerifyFailed;
-    }
+    const der = cert_der orelse return HandshakeCompleteError.MissingCertificate;
+    const cv_msg = tls_messages.parseCertificateVerify(cv_parsed.msg.payload) orelse
+        return HandshakeCompleteError.MissingCertificateVerify;
+    const transcript_before_cv = transcript.current();
+    tls_messages.verifyCertificateVerify(transcript_before_cv, der, cv_msg) catch
+        return HandshakeCompleteError.CertificateVerifyFailed;
 
     transcript.update(crypto_data[pos..][0..cv_parsed.consumed]);
     pos += cv_parsed.consumed;
@@ -247,76 +245,63 @@ pub fn buildClientFinishedPacket(
 
 // ─── Tests ───
 
-test "processServerHandshakeFlight: full valid flight" {
-    // Simulate a server handshake flight: EE + Cert + CV + Finished
-    // We use synthetic data and pre-compute the Finished verify_data.
+test "processServerHandshakeFlight: full valid flight with CertificateVerify" {
+    const server_hs = @import("server_handshake.zig");
+    const Ed25519 = std.crypto.sign.Ed25519;
 
-    // First set up the handshake keys (use deterministic values)
+    // Generate server signing key and certificate
+    const signing_kp = Ed25519.KeyPair.generate();
+    var cert_der_buf: [1024]u8 = undefined;
+    const cert_der_len = server_hs.buildSelfSignedCertDer(&cert_der_buf, signing_kp) orelse unreachable;
+    const cert_der = cert_der_buf[0..cert_der_len];
+
+    // Set up handshake keys (deterministic values)
     const private_key = [_]u8{0x42} ** 32;
     const server_public = std.crypto.dh.X25519.recoverPublicKey([_]u8{0x77} ** 32) catch unreachable;
     const fake_transcript_ch_sh = [_]u8{0xAB} ** 32;
     const hs_keys = handshake_mod.deriveHandshakeKeys(private_key, &server_public, fake_transcript_ch_sh) catch unreachable;
 
     // Build the server's handshake CRYPTO data
-    var flight_buf: [256]u8 = undefined;
+    var flight_buf: [2048]u8 = undefined;
     var fpos: usize = 0;
 
-    // EncryptedExtensions with ALPN "h3": type(0x08) + len + extensions
-    // extensions: list_len(2) + ALPN ext(type=0x0010, data_len, list_len, "h3")
+    // EncryptedExtensions with ALPN "h3"
     flight_buf[fpos] = 0x08;
     flight_buf[fpos + 1] = 0;
     flight_buf[fpos + 2] = 0;
-    flight_buf[fpos + 3] = 13; // payload len = 13
-    // extensions list len = 11
+    flight_buf[fpos + 3] = 13;
     std.mem.writeInt(u16, flight_buf[fpos + 4 ..][0..2], 11, .big);
-    // ALPN extension
     std.mem.writeInt(u16, flight_buf[fpos + 6 ..][0..2], 0x0010, .big);
-    std.mem.writeInt(u16, flight_buf[fpos + 8 ..][0..2], 5, .big); // ext data len
-    std.mem.writeInt(u16, flight_buf[fpos + 10 ..][0..2], 3, .big); // ALPN list len
-    flight_buf[fpos + 12] = 2; // "h3" len
+    std.mem.writeInt(u16, flight_buf[fpos + 8 ..][0..2], 5, .big);
+    std.mem.writeInt(u16, flight_buf[fpos + 10 ..][0..2], 3, .big);
+    flight_buf[fpos + 12] = 2;
     flight_buf[fpos + 13] = 'h';
     flight_buf[fpos + 14] = '3';
-    // EncryptedExtensions total = 4 (header) + 13 (payload) = 17
     const ee_len: usize = 17;
     fpos += ee_len;
 
-    // Certificate: type(0x0B) + len(4) + ctx_len(0) + certs_len(0)
-    flight_buf[fpos] = 0x0B;
-    flight_buf[fpos + 1] = 0;
-    flight_buf[fpos + 2] = 0;
-    flight_buf[fpos + 3] = 4;
-    flight_buf[fpos + 4] = 0; // ctx_len = 0
-    flight_buf[fpos + 5] = 0;
-    flight_buf[fpos + 6] = 0;
-    flight_buf[fpos + 7] = 0; // certs_len = 0
-    const cert_len: usize = 8;
-    fpos += cert_len;
+    // Certificate with real self-signed cert
+    const cert_msg_len = server_hs.buildCertificateMsg(flight_buf[fpos..], cert_der) orelse unreachable;
+    fpos += cert_msg_len;
 
-    // CertificateVerify: type(0x0F) + len(4) + sig_alg(2) + sig_len(0) + sig_data(0)
-    flight_buf[fpos] = 0x0F;
-    flight_buf[fpos + 1] = 0;
-    flight_buf[fpos + 2] = 0;
-    flight_buf[fpos + 3] = 4;
-    flight_buf[fpos + 4] = 0x04;
-    flight_buf[fpos + 5] = 0x01; // rsa_pkcs1_sha256
-    flight_buf[fpos + 6] = 0;
-    flight_buf[fpos + 7] = 0; // sig_len = 0
-    const cv_len: usize = 8;
+    // Compute transcript hash before CertificateVerify (EE + Cert fed so far)
+    var transcript = tls_messages.TranscriptHash.init();
+    transcript.update(&fake_transcript_ch_sh);
+    transcript.update(flight_buf[0..ee_len]);
+    transcript.update(flight_buf[ee_len..][0..cert_msg_len]);
+    const transcript_before_cv = transcript.current();
+
+    // CertificateVerify with real Ed25519 signature
+    const cv_len = server_hs.buildCertificateVerify(flight_buf[fpos..], transcript_before_cv, signing_kp) orelse unreachable;
     fpos += cv_len;
 
-    // Compute the transcript hash that the server would use for Finished
-    var transcript = tls_messages.TranscriptHash.init();
-    // Feed a fake CH+SH to match the key derivation
-    transcript.update(&fake_transcript_ch_sh);
-    // Feed EE + Cert + CV
-    transcript.update(flight_buf[0..ee_len]); // EE
-    transcript.update(flight_buf[ee_len..][0..cert_len]); // Cert
-    transcript.update(flight_buf[ee_len + cert_len ..][0..cv_len]); // CV
+    // Feed CV to transcript for Finished computation
+    transcript.update(flight_buf[ee_len + cert_msg_len ..][0..cv_len]);
     const th_before_fin = transcript.current();
 
     // Generate correct server Finished
     const server_verify = tls_messages.generateClientFinished(hs_keys.server_handshake_secret, th_before_fin);
-    flight_buf[fpos] = 0x14; // Finished
+    flight_buf[fpos] = 0x14;
     flight_buf[fpos + 1] = 0;
     flight_buf[fpos + 2] = 0;
     flight_buf[fpos + 3] = 32;
@@ -351,13 +336,74 @@ test "processServerHandshakeFlight: full valid flight" {
     try std.testing.expectEqual(@as(u8, 0x14), result.client_finished_msg[0]);
 }
 
+test "processServerHandshakeFlight: empty certificate rejected" {
+    // Verify that empty Certificate (certs_len=0) is now rejected
+    const private_key = [_]u8{0x42} ** 32;
+    const server_public = std.crypto.dh.X25519.recoverPublicKey([_]u8{0x77} ** 32) catch unreachable;
+    const fake_transcript_ch_sh = [_]u8{0xAB} ** 32;
+    const hs_keys = handshake_mod.deriveHandshakeKeys(private_key, &server_public, fake_transcript_ch_sh) catch unreachable;
+
+    var flight_buf: [256]u8 = undefined;
+    var fpos: usize = 0;
+
+    // EncryptedExtensions with ALPN "h3"
+    flight_buf[fpos] = 0x08;
+    flight_buf[fpos + 1] = 0;
+    flight_buf[fpos + 2] = 0;
+    flight_buf[fpos + 3] = 13;
+    std.mem.writeInt(u16, flight_buf[fpos + 4 ..][0..2], 11, .big);
+    std.mem.writeInt(u16, flight_buf[fpos + 6 ..][0..2], 0x0010, .big);
+    std.mem.writeInt(u16, flight_buf[fpos + 8 ..][0..2], 5, .big);
+    std.mem.writeInt(u16, flight_buf[fpos + 10 ..][0..2], 3, .big);
+    flight_buf[fpos + 12] = 2;
+    flight_buf[fpos + 13] = 'h';
+    flight_buf[fpos + 14] = '3';
+    fpos += 17;
+
+    // Empty Certificate: certs_len = 0
+    flight_buf[fpos] = 0x0B;
+    flight_buf[fpos + 1] = 0;
+    flight_buf[fpos + 2] = 0;
+    flight_buf[fpos + 3] = 4;
+    flight_buf[fpos + 4] = 0; // ctx_len = 0
+    flight_buf[fpos + 5] = 0;
+    flight_buf[fpos + 6] = 0;
+    flight_buf[fpos + 7] = 0; // certs_len = 0
+    fpos += 8;
+
+    // CertificateVerify (dummy, should never be reached)
+    flight_buf[fpos] = 0x0F;
+    flight_buf[fpos + 1] = 0;
+    flight_buf[fpos + 2] = 0;
+    flight_buf[fpos + 3] = 4;
+    flight_buf[fpos + 4] = 0x08;
+    flight_buf[fpos + 5] = 0x07; // ed25519
+    flight_buf[fpos + 6] = 0;
+    flight_buf[fpos + 7] = 0; // sig_len = 0
+    fpos += 8;
+
+    var test_transcript = tls_messages.TranscriptHash.init();
+    test_transcript.update(&fake_transcript_ch_sh);
+
+    const result = processServerHandshakeFlight(flight_buf[0..fpos], hs_keys, &test_transcript);
+    try std.testing.expectError(HandshakeCompleteError.MissingCertificate, result);
+}
+
 test "processServerHandshakeFlight: wrong Finished rejected" {
+    const server_hs = @import("server_handshake.zig");
+    const Ed25519 = std.crypto.sign.Ed25519;
+
+    const signing_kp = Ed25519.KeyPair.generate();
+    var cert_der_buf: [1024]u8 = undefined;
+    const cert_der_len = server_hs.buildSelfSignedCertDer(&cert_der_buf, signing_kp) orelse unreachable;
+    const cert_der = cert_der_buf[0..cert_der_len];
+
     const private_key = [_]u8{0x42} ** 32;
     const server_public = std.crypto.dh.X25519.recoverPublicKey([_]u8{0x77} ** 32) catch unreachable;
     const fake_transcript = [_]u8{0xAB} ** 32;
     const hs_keys = handshake_mod.deriveHandshakeKeys(private_key, &server_public, fake_transcript) catch unreachable;
 
-    var flight_buf: [256]u8 = undefined;
+    var flight_buf: [2048]u8 = undefined;
     var fpos: usize = 0;
 
     // EE with ALPN "h3"
@@ -372,42 +418,34 @@ test "processServerHandshakeFlight: wrong Finished rejected" {
     flight_buf[fpos + 12] = 2;
     flight_buf[fpos + 13] = 'h';
     flight_buf[fpos + 14] = '3';
-    fpos += 17;
+    const ee_len: usize = 17;
+    fpos += ee_len;
 
-    // Cert
-    flight_buf[fpos] = 0x0B;
-    flight_buf[fpos + 1] = 0;
-    flight_buf[fpos + 2] = 0;
-    flight_buf[fpos + 3] = 4;
-    flight_buf[fpos + 4] = 0;
-    flight_buf[fpos + 5] = 0;
-    flight_buf[fpos + 6] = 0;
-    flight_buf[fpos + 7] = 0;
-    fpos += 8;
+    // Real Certificate
+    const cert_msg_len = server_hs.buildCertificateMsg(flight_buf[fpos..], cert_der) orelse unreachable;
+    fpos += cert_msg_len;
 
-    // CV
-    flight_buf[fpos] = 0x0F;
-    flight_buf[fpos + 1] = 0;
-    flight_buf[fpos + 2] = 0;
-    flight_buf[fpos + 3] = 4;
-    flight_buf[fpos + 4] = 0x04;
-    flight_buf[fpos + 5] = 0x01;
-    flight_buf[fpos + 6] = 0;
-    flight_buf[fpos + 7] = 0;
-    fpos += 8;
+    // Real CertificateVerify
+    var transcript = tls_messages.TranscriptHash.init();
+    transcript.update(&fake_transcript);
+    transcript.update(flight_buf[0..ee_len]);
+    transcript.update(flight_buf[ee_len..][0..cert_msg_len]);
+    const transcript_before_cv = transcript.current();
+    const cv_len = server_hs.buildCertificateVerify(flight_buf[fpos..], transcript_before_cv, signing_kp) orelse unreachable;
+    fpos += cv_len;
 
     // Bad Finished (wrong verify_data)
     flight_buf[fpos] = 0x14;
     flight_buf[fpos + 1] = 0;
     flight_buf[fpos + 2] = 0;
     flight_buf[fpos + 3] = 32;
-    @memset(flight_buf[fpos + 4 ..][0..32], 0xFF); // bad data
+    @memset(flight_buf[fpos + 4 ..][0..32], 0xFF);
     fpos += 36;
 
-    var transcript = tls_messages.TranscriptHash.init();
-    transcript.update(&fake_transcript);
+    var test_transcript = tls_messages.TranscriptHash.init();
+    test_transcript.update(&fake_transcript);
 
-    const result = processServerHandshakeFlight(flight_buf[0..fpos], hs_keys, &transcript);
+    const result = processServerHandshakeFlight(flight_buf[0..fpos], hs_keys, &test_transcript);
     try std.testing.expectError(HandshakeCompleteError.FinishedVerificationFailed, result);
 }
 
