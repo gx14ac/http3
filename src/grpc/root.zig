@@ -67,6 +67,17 @@ pub const h3_health = @import("h3_health.zig");
 pub const H3HealthClient = h3_health.H3HealthClient;
 pub const H3HealthWatcher = h3_health.H3HealthWatcher;
 
+pub const grpc_server = @import("server.zig");
+pub const GrpcServer = grpc_server.GrpcServer;
+pub const GrpcRequest = grpc_server.GrpcRequest;
+pub const GrpcResponse = grpc_server.GrpcResponse;
+pub const GrpcServerEvent = grpc_server.GrpcServerEvent;
+pub const GrpcServerError = grpc_server.GrpcServerError;
+pub const ServiceHandler = grpc_server.ServiceHandler;
+pub const ServiceRoute = grpc_server.ServiceRoute;
+pub const ServerStream = grpc_server.ServerStream;
+pub const GrpcStreamMessage = grpc_server.GrpcStreamMessage;
+
 pub const StreamInterceptor = stream_interceptor.StreamInterceptor;
 pub const StreamInterceptorChain = stream_interceptor.StreamInterceptorChain;
 pub const StreamInvoker = stream_interceptor.StreamInvoker;
@@ -87,6 +98,8 @@ test {
     _ = conn_pool;
     _ = h3_channel;
     _ = h3_health;
+    _ = grpc_server;
+    _ = @import("server_e2e_test.zig");
     _ = @import("h3_e2e_test.zig");
     _ = @import("integration_test.zig");
 }
