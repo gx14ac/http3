@@ -272,6 +272,7 @@ pub const ApplicationKeysWithSecrets = struct {
     keys: ApplicationKeys,
     client_secret: [32]u8,
     server_secret: [32]u8,
+    master_secret: [32]u8,
 };
 
 pub fn deriveApplicationKeys(
@@ -301,6 +302,7 @@ pub fn deriveApplicationKeysWithSecrets(
     quic_crypto.hkdfExpandLabel(&server_secret, &master_secret, "s ap traffic", &transcript_hash_handshake);
 
     var result: ApplicationKeysWithSecrets = undefined;
+    result.master_secret = master_secret;
     result.client_secret = client_secret;
     result.server_secret = server_secret;
     quic_crypto.hkdfExpandLabel(&result.keys.client_key, &client_secret, "quic key", "");

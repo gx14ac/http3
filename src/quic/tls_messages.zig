@@ -64,6 +64,7 @@ pub const EncryptedExtensions = struct {
     alpn: ?[]const u8,
     has_quic_params: bool,
     peer_params: ?transport_params_mod.PeerTransportParams,
+    early_data_accepted: bool,
 };
 
 /// Parse EncryptedExtensions payload.
@@ -72,7 +73,7 @@ pub fn parseEncryptedExtensions(payload: []const u8) ?EncryptedExtensions {
     const ext_len = std.mem.readInt(u16, payload[0..2], .big);
     if (payload.len < 2 + ext_len) return null;
 
-    var result = EncryptedExtensions{ .alpn = null, .has_quic_params = false, .peer_params = null };
+    var result = EncryptedExtensions{ .alpn = null, .has_quic_params = false, .peer_params = null, .early_data_accepted = false };
     var pos: usize = 2;
     const ext_end: usize = 2 + ext_len;
 
@@ -96,6 +97,9 @@ pub fn parseEncryptedExtensions(payload: []const u8) ?EncryptedExtensions {
             // QUIC transport parameters
             result.has_quic_params = true;
             result.peer_params = transport_params_mod.decodePeerParams(payload[pos..][0..ext_data_len]);
+        } else if (ext_type == 0x002a) {
+            // early_data (RFC 8446 §4.3.1) — presence means server accepted 0-RTT
+            result.early_data_accepted = true;
         }
 
         pos += ext_data_len;
@@ -361,6 +365,32 @@ test "parseEncryptedExtensions: with QUIC transport params" {
 
     const ee = parseEncryptedExtensions(buf[0..10]) orelse unreachable;
     try std.testing.expect(ee.has_quic_params);
+}
+
+test "parseEncryptedExtensions: with early_data accepted" {
+    var buf: [12]u8 = undefined;
+    // extensions total length = 8 (ALPN not needed; just early_data 0x002a)
+    std.mem.writeInt(u16, buf[0..2], 4, .big); // total ext len = 4
+    std.mem.writeInt(u16, buf[2..4], 0x002a, .big); // early_data type
+    std.mem.writeInt(u16, buf[4..6], 0, .big); // ext data len = 0 (empty in EE)
+
+    const ee = parseEncryptedExtensions(buf[0..6]) orelse unreachable;
+    try std.testing.expect(ee.early_data_accepted);
+}
+
+test "parseEncryptedExtensions: no early_data means rejected" {
+    var buf: [16]u8 = undefined;
+    // Only QUIC transport params, no early_data
+    std.mem.writeInt(u16, buf[0..2], 8, .big);
+    std.mem.writeInt(u16, buf[2..4], 0x0039, .big);
+    std.mem.writeInt(u16, buf[4..6], 4, .big);
+    buf[6] = 0x04;
+    buf[7] = 0x01;
+    buf[8] = 0x00;
+    buf[9] = 0x00;
+
+    const ee = parseEncryptedExtensions(buf[0..10]) orelse unreachable;
+    try std.testing.expect(!ee.early_data_accepted);
 }
 
 test "parseCertificate: single cert" {

@@ -25,11 +25,13 @@ pub const HandshakeResult = struct {
     application_keys: handshake_flight.ApplicationKeys,
     client_traffic_secret: [32]u8,
     server_traffic_secret: [32]u8,
+    master_secret: [32]u8,
     client_finished_msg: [36]u8,
     client_finished_msg_len: usize,
     transcript_after_server_finished: [32]u8,
     transcript_after_client_finished: [32]u8,
     peer_transport_params: ?transport_params_mod.PeerTransportParams,
+    early_data_accepted: bool,
 };
 
 /// Orchestrates the full TLS 1.3 handshake message processing.
@@ -138,11 +140,13 @@ pub fn processServerHandshakeFlight(
         .application_keys = app.keys,
         .client_traffic_secret = app.client_secret,
         .server_traffic_secret = app.server_secret,
+        .master_secret = app.master_secret,
         .client_finished_msg = client_finished_msg,
         .client_finished_msg_len = cfm_len,
         .transcript_after_server_finished = transcript_after_server_finished,
         .transcript_after_client_finished = transcript_after_client_finished,
         .peer_transport_params = ee.peer_params,
+        .early_data_accepted = ee.early_data_accepted,
     };
 }
 
