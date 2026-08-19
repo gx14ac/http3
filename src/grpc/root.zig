@@ -101,5 +101,6 @@ test {
     _ = grpc_server;
     _ = @import("server_e2e_test.zig");
     _ = @import("h3_e2e_test.zig");
+    _ = @import("h3_local_test.zig");
     _ = @import("integration_test.zig");
 }

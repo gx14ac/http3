@@ -19,6 +19,7 @@ pub const GrpcServerError = error{
     InvalidRequest,
     HandlerFailed,
     MessageTooLarge,
+    DeadlineExceeded,
 };
 
 pub const GrpcRequest = struct {
@@ -34,6 +35,7 @@ pub const GrpcRequest = struct {
     method_len: usize,
     conn_idx: usize,
     stream_id: u62,
+    deadline_ns: ?i128,
 
     pub const MAX_PAYLOAD = 16384;
 
@@ -55,6 +57,18 @@ pub const GrpcRequest = struct {
 
     pub fn payload(self: *const GrpcRequest) []const u8 {
         return self.payload_buf[0..self.payload_len];
+    }
+
+    pub fn isExpired(self: *const GrpcRequest) bool {
+        return isDeadlineExceeded(self.deadline_ns);
+    }
+
+    /// Returns remaining time in milliseconds, or null if no deadline is set.
+    pub fn remainingMs(self: *const GrpcRequest) ?u64 {
+        const dl = self.deadline_ns orelse return null;
+        const now: i128 = std.time.nanoTimestamp();
+        if (now >= dl) return 0;
+        return @intCast(@divFloor(dl - now, 1_000_000));
     }
 };
 
@@ -104,6 +118,7 @@ pub const ServerStream = struct {
     conn_idx: usize,
     stream_id: u62,
     headers_sent: bool,
+    deadline_ns: ?i128,
 
     /// Send initial response headers (HTTP 200 + content-type). Called automatically on first send.
     pub fn sendHeaders(self: *ServerStream) GrpcServerError!void {
@@ -134,6 +149,8 @@ pub const ServerStream = struct {
     pub fn recv(self: *ServerStream) GrpcServerError!?GrpcStreamMessage {
         var attempts: usize = 0;
         while (attempts < 20) : (attempts += 1) {
+            if (isDeadlineExceeded(self.deadline_ns)) return GrpcServerError.DeadlineExceeded;
+
             const event = self.server.poll();
             switch (event) {
                 .data => |msg| {
@@ -141,7 +158,6 @@ pub const ServerStream = struct {
                         if (msg.payload_len == 0 and msg.fin) return null;
                         return msg;
                     }
-                    // Not for this stream — enqueue for later
                     _ = self.server.enqueue(.{ .data = msg });
                 },
                 .timeout => return GrpcServerError.InvalidRequest,
@@ -155,6 +171,10 @@ pub const ServerStream = struct {
             }
         }
         return GrpcServerError.InvalidRequest;
+    }
+
+    pub fn isExpired(self: *const ServerStream) bool {
+        return isDeadlineExceeded(self.deadline_ns);
     }
 
     /// Close the stream with a gRPC status (trailers-only HEADERS frame + FIN).
@@ -218,6 +238,7 @@ pub const GrpcServer = struct {
             .conn_idx = req.conn_idx,
             .stream_id = req.stream_id,
             .headers_sent = false,
+            .deadline_ns = req.deadline_ns,
         };
     }
 
@@ -326,6 +347,10 @@ pub const GrpcServer = struct {
 
     /// Dispatch request to matching handler and send response automatically.
     pub fn handleAndRespond(self: *GrpcServer, req: *const GrpcRequest) GrpcServerError!void {
+        if (isDeadlineExceeded(req.deadline_ns)) {
+            return self.sendError(req.conn_idx, req.stream_id, .deadline_exceeded, "deadline exceeded");
+        }
+
         const handler = self.findHandler(req.path()) orelse {
             return self.sendError(req.conn_idx, req.stream_id, .unimplemented, "method not found");
         };
@@ -334,6 +359,10 @@ pub const GrpcServer = struct {
         const response = handler.handle(req, &response_buf) orelse {
             return self.sendError(req.conn_idx, req.stream_id, .internal, "handler error");
         };
+
+        if (isDeadlineExceeded(req.deadline_ns)) {
+            return self.sendError(req.conn_idx, req.stream_id, .deadline_exceeded, "deadline exceeded");
+        }
 
         return self.sendResponse(req.conn_idx, req.stream_id, response);
     }
@@ -369,6 +398,15 @@ pub const GrpcServer = struct {
         }
         req.conn_idx = h3_req.conn_idx;
         req.stream_id = h3_req.stream_id;
+
+        // Parse grpc-timeout header → compute absolute deadline
+        req.deadline_ns = null;
+        for (h3_req.headers[0..h3_req.header_count]) |h| {
+            if (std.mem.eql(u8, h.name, "grpc-timeout")) {
+                req.deadline_ns = computeDeadlineFromTimeout(h.value);
+                break;
+            }
+        }
 
         // Compute service/method offsets from the owned path_buf
         // path: /Service/Method → skip leading '/'
@@ -453,6 +491,33 @@ fn isGrpcContentType(ct: []const u8) bool {
     return std.mem.startsWith(u8, ct, "application/grpc");
 }
 
+/// Parse gRPC timeout value (e.g. "100m", "5S", "1H") into an absolute deadline (ns).
+/// Format: <digits><unit> where unit is H/M/S/m/u/n.
+fn computeDeadlineFromTimeout(value: []const u8) ?i128 {
+    if (value.len < 2) return null;
+    const unit = value[value.len - 1];
+    const digits = value[0 .. value.len - 1];
+    const num = std.fmt.parseInt(u64, digits, 10) catch return null;
+
+    const ns_per_unit: u64 = switch (unit) {
+        'H' => 3_600_000_000_000,
+        'M' => 60_000_000_000,
+        'S' => 1_000_000_000,
+        'm' => 1_000_000,
+        'u' => 1_000,
+        'n' => 1,
+        else => return null,
+    };
+
+    const now: i128 = std.time.nanoTimestamp();
+    return now + @as(i128, num) * @as(i128, ns_per_unit);
+}
+
+fn isDeadlineExceeded(deadline_ns: ?i128) bool {
+    const dl = deadline_ns orelse return false;
+    return std.time.nanoTimestamp() >= dl;
+}
+
 fn grpcStatusToStr(code: status_mod.Code, buf: *[3]u8) []const u8 {
     const v: u8 = @intFromEnum(code);
     if (v < 10) {
@@ -525,4 +590,45 @@ test "GrpcServer: poll timeout" {
     server.setTimeout(10);
     const event = server.poll();
     try std.testing.expect(event == .timeout);
+}
+
+test "computeDeadlineFromTimeout: valid formats" {
+    // 5 seconds should produce a deadline ~5s in the future
+    const dl_5s = computeDeadlineFromTimeout("5S").?;
+    const now: i128 = std.time.nanoTimestamp();
+    try std.testing.expect(dl_5s > now);
+    try std.testing.expect(dl_5s - now < 6_000_000_000); // less than 6s
+
+    // 100 milliseconds
+    const dl_100m = computeDeadlineFromTimeout("100m").?;
+    try std.testing.expect(dl_100m > now);
+    try std.testing.expect(dl_100m - now < 200_000_000); // less than 200ms
+
+    // 1 hour
+    const dl_1h = computeDeadlineFromTimeout("1H").?;
+    try std.testing.expect(dl_1h - now > 3_500_000_000_000); // > 3500s
+
+    // 2 minutes
+    const dl_2m = computeDeadlineFromTimeout("2M").?;
+    try std.testing.expect(dl_2m - now > 100_000_000_000); // > 100s
+}
+
+test "computeDeadlineFromTimeout: invalid formats" {
+    try std.testing.expect(computeDeadlineFromTimeout("") == null);
+    try std.testing.expect(computeDeadlineFromTimeout("X") == null);
+    try std.testing.expect(computeDeadlineFromTimeout("5x") == null);
+    try std.testing.expect(computeDeadlineFromTimeout("abcS") == null);
+}
+
+test "isDeadlineExceeded: null is never exceeded" {
+    try std.testing.expect(!isDeadlineExceeded(null));
+}
+
+test "isDeadlineExceeded: past deadline is exceeded" {
+    try std.testing.expect(isDeadlineExceeded(0));
+}
+
+test "isDeadlineExceeded: future deadline is not exceeded" {
+    const future: i128 = std.time.nanoTimestamp() + 10_000_000_000;
+    try std.testing.expect(!isDeadlineExceeded(future));
 }
