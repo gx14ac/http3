@@ -159,6 +159,13 @@ pub const CubicCc = struct {
         self.ack_last_loss_us = null;
     }
 
+    /// Handle ECN CE signal — enters recovery if not already in this round.
+    pub fn onCongestionEvent(self: *CubicCc, now_us: u64) void {
+        const recovery_start = self.recovery_start_time_us orelse 0;
+        if (now_us <= recovery_start) return;
+        self.enterRecovery(now_us);
+    }
+
     pub fn packetDiscarded(self: *CubicCc, sent: *const SentPacket) void {
         if (sent.in_flight) {
             if (self.bytes_in_flight >= sent.size) {

@@ -373,6 +373,20 @@ pub const CongestionController = struct {
         self.ack_last_loss_us = null;
     }
 
+    /// Handle ECN Congestion Experienced (CE) signal.
+    /// Triggers recovery (same as loss) if not already in recovery for this round.
+    pub fn onCongestionEvent(self: *CongestionController, now_us: u64) void {
+        const recovery_start = self.recovery_start_time_us orelse 0;
+        if (now_us <= recovery_start) return;
+
+        self.recovery_start_time_us = now_us;
+        self.ssthresh = self.congestion_window / 2;
+        self.congestion_window = @max(self.ssthresh, self.minimumCongestionWindow());
+        self.send_one_packet_in_recovery = true;
+        self.congestion_pending_acks = 0;
+        self.in_recovery = true;
+    }
+
     /// Packet discarded (keys dropped). Remove from bytes_in_flight without triggering CC.
     pub fn packetDiscarded(self: *CongestionController, sent: *const SentPacket) void {
         if (sent.in_flight) {
@@ -635,6 +649,13 @@ pub const CcState = struct {
         switch (self.algo) {
             .new_reno => self.new_reno.packetDiscarded(sent),
             .cubic => self.cubic.packetDiscarded(sent),
+        }
+    }
+
+    pub fn onCongestionEvent(self: *CcState, now_us: u64) void {
+        switch (self.algo) {
+            .new_reno => self.new_reno.onCongestionEvent(now_us),
+            .cubic => self.cubic.onCongestionEvent(now_us),
         }
     }
 
@@ -914,6 +935,12 @@ pub const LossDetector = struct {
     /// Get the current loss detection timer deadline.
     pub fn getTimer(self: *const LossDetector) ?u64 {
         return self.loss_detection_timer_us;
+    }
+
+    /// Handle ECN Congestion Experienced (CE) signal from peer's ACK_ECN.
+    /// Triggers congestion response (same as loss) if not already in recovery.
+    pub fn onEcnCongestion(self: *LossDetector, now_us: u64) void {
+        self.cc.onCongestionEvent(now_us);
     }
 
     /// Available send budget before congestion window is full.

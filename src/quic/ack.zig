@@ -1,5 +1,6 @@
 const std = @import("std");
 const packet_mod = @import("packet.zig");
+const ecn_mod = @import("ecn.zig");
 
 /// Tracks received packet numbers and generates ACK frames.
 /// Maintains up to MAX_RANGES contiguous ranges of received PNs.
@@ -95,6 +96,59 @@ pub const AckTracker = struct {
             const ack_range = sorted[i].end - sorted[i].start;
             pos += packet_mod.encodeVarint(buf[pos..], @intCast(ack_range)) orelse return null;
         }
+
+        return pos;
+    }
+
+    /// Build an ACK_ECN frame (type 0x03) into buf.
+    /// Like buildAckFrame but appends ECN counts at the end.
+    pub fn buildAckEcnFrame(self: *const AckTracker, buf: []u8, now_us: u64, ecn_counts: ecn_mod.EcnCounts) ?usize {
+        if (self.range_count == 0) return null;
+
+        var sorted: [MAX_RANGES]PnRange = undefined;
+        @memcpy(sorted[0..self.range_count], self.ranges[0..self.range_count]);
+        sortRangesDesc(sorted[0..self.range_count]);
+
+        var pos: usize = 0;
+
+        // Frame type: 0x03 (ACK with ECN)
+        if (buf.len < 1) return null;
+        buf[pos] = 0x03;
+        pos += 1;
+
+        // Largest Acknowledged
+        const largest = sorted[0].end;
+        pos += packet_mod.encodeVarint(buf[pos..], @intCast(largest)) orelse return null;
+
+        // ACK Delay
+        const delay_us = if (now_us > self.largest_recv_time) now_us - self.largest_recv_time else 0;
+        const ack_delay = delay_us / 8;
+        pos += packet_mod.encodeVarint(buf[pos..], @intCast(ack_delay)) orelse return null;
+
+        // ACK Range Count
+        const range_count: usize = if (self.range_count > 0) self.range_count - 1 else 0;
+        pos += packet_mod.encodeVarint(buf[pos..], range_count) orelse return null;
+
+        // First ACK Range
+        const first_range = sorted[0].end - sorted[0].start;
+        pos += packet_mod.encodeVarint(buf[pos..], @intCast(first_range)) orelse return null;
+
+        // Additional ranges
+        var i: usize = 1;
+        while (i < self.range_count) : (i += 1) {
+            const prev_start = sorted[i - 1].start;
+            const curr_end = sorted[i].end;
+            if (prev_start <= curr_end + 1) break;
+            const gap = prev_start - curr_end - 2;
+            pos += packet_mod.encodeVarint(buf[pos..], @intCast(gap)) orelse return null;
+            const ack_range = sorted[i].end - sorted[i].start;
+            pos += packet_mod.encodeVarint(buf[pos..], @intCast(ack_range)) orelse return null;
+        }
+
+        // ECN counts (RFC 9000 §19.3.2)
+        pos += packet_mod.encodeVarint(buf[pos..], ecn_counts.ect0) orelse return null;
+        pos += packet_mod.encodeVarint(buf[pos..], ecn_counts.ect1) orelse return null;
+        pos += packet_mod.encodeVarint(buf[pos..], ecn_counts.ce) orelse return null;
 
         return pos;
     }
@@ -473,4 +527,42 @@ test "buildAckPacket: application level" {
 
     // Should produce a short-header packet (form bit = 0)
     try std.testing.expect(len > 0);
+}
+
+test "AckTracker.buildAckEcnFrame: includes ECN counts" {
+    var tracker = AckTracker.init();
+    tracker.recordPacket(0, 100);
+    tracker.recordPacket(1, 200);
+    tracker.recordPacket(2, 300);
+
+    const counts = ecn_mod.EcnCounts{ .ect0 = 42, .ect1 = 3, .ce = 1 };
+    var buf: [128]u8 = undefined;
+    const len = tracker.buildAckEcnFrame(&buf, 500, counts) orelse unreachable;
+    try std.testing.expect(len > 0);
+
+    // Frame type should be 0x03 (ACK_ECN)
+    try std.testing.expectEqual(@as(u8, 0x03), buf[0]);
+
+    // Parse: skip type, largest, delay, range_count, first_range → then ECN counts
+    var pos: usize = 1;
+    pos += (packet_mod.decodeVarint(buf[pos..]) orelse unreachable).consumed; // largest
+    pos += (packet_mod.decodeVarint(buf[pos..]) orelse unreachable).consumed; // delay
+    const rc = packet_mod.decodeVarint(buf[pos..]) orelse unreachable;
+    pos += rc.consumed; // range_count
+    pos += (packet_mod.decodeVarint(buf[pos..]) orelse unreachable).consumed; // first_range
+
+    // No additional ranges (range_count=0), so ECN counts follow directly
+    try std.testing.expectEqual(@as(u64, 0), rc.value);
+
+    const ect0 = packet_mod.decodeVarint(buf[pos..]) orelse unreachable;
+    pos += ect0.consumed;
+    const ect1 = packet_mod.decodeVarint(buf[pos..]) orelse unreachable;
+    pos += ect1.consumed;
+    const ce = packet_mod.decodeVarint(buf[pos..]) orelse unreachable;
+    pos += ce.consumed;
+
+    try std.testing.expectEqual(@as(u64, 42), ect0.value);
+    try std.testing.expectEqual(@as(u64, 3), ect1.value);
+    try std.testing.expectEqual(@as(u64, 1), ce.value);
+    try std.testing.expectEqual(len, pos);
 }
