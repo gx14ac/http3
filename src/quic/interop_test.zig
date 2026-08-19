@@ -3,11 +3,13 @@ const h3_client_mod = @import("h3_client.zig");
 const h3_server_mod = @import("h3_server.zig");
 const client_mod = @import("client.zig");
 const server_mod = @import("server.zig");
+const stream_mod = @import("stream.zig");
 
 const H3Client = h3_client_mod.H3Client;
 const H3Server = h3_server_mod.H3Server;
 const QuicClient = client_mod.QuicClient;
 const QuicServer = server_mod.QuicServer;
+const StreamFrame = stream_mod.StreamFrame;
 
 // ─── Localhost Interop Tests ───
 // Validates RFC compliance by running our own server and client against each other.
@@ -117,26 +119,31 @@ test "interop-local: bidirectional stream data exchange" {
         return;
     };
 
-    // Send data on a stream
-    const stream_id: u62 = 0; // client-initiated bidi stream
+    // Open a stream via the stream manager, then send data
+    const stream_id = client.openStream() orelse {
+        server_thread.join();
+        return;
+    };
     const payload = "hello QUIC";
     _ = client.writeStream(stream_id, payload, true) orelse {
         server_thread.join();
         return;
     };
 
-    // Receive echo
+    // Receive echo — parse STREAM frames from raw payload
     var received = false;
     var iterations: usize = 0;
     while (iterations < 30) : (iterations += 1) {
         const result = client.poll();
         switch (result) {
             .received => {
-                const data = client.lastStreamData();
-                if (data.len > 0) {
-                    try std.testing.expectEqualStrings(payload, data);
-                    received = true;
-                    break;
+                const raw = client.lastStreamData();
+                if (raw.len > 0) {
+                    if (StreamFrame.decode(raw)) |decoded| {
+                        try std.testing.expectEqualStrings(payload, decoded.frame.data);
+                        received = true;
+                        break;
+                    }
                 }
             },
             .closed => break,
