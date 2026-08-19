@@ -139,6 +139,19 @@ pub const MigrationManager = struct {
         } };
     }
 
+    /// Client-initiated migration: transition to probing state for a new peer.
+    /// Anti-amplification does not apply to client-initiated paths (client sends first).
+    pub fn initiateClientMigration(self: *MigrationManager, new_peer: PeerAddress, bytes_sent: u64, now_us: u64) void {
+        self.previous_peer = self.current_peer;
+        self.current_peer = new_peer;
+        self.state = .probing;
+        self.probe_start_us = now_us;
+        self.probe_attempts = 1;
+        self.bytes_sent_on_new_path = bytes_sent;
+        self.bytes_received_on_new_path = 0;
+        self.amplification_budget = 0;
+    }
+
     /// Called when PATH_CHALLENGE is sent on the new path.
     pub fn onProbeSent(self: *MigrationManager, bytes_sent: u64, now_us: u64) void {
         self.probe_attempts += 1;

@@ -291,6 +291,11 @@ pub const H3Client = struct {
 
     /// Deliver stream data to the appropriate buffer at the correct offset.
     fn onStreamData(self: *H3Client, stream_id: u62, offset: u64, data: []const u8, fin: bool) void {
+        // Track received bytes for flow control
+        if (data.len > 0) {
+            self.quic.onStreamDataReceived(stream_id, data.len);
+        }
+
         // Detect new server-initiated uni-stream (low 2 bits = 0b11)
         if (stream_id & 0x03 == 0x03 and offset == 0 and self.server_control_stream_id == null) {
             if (data.len > 0 and data[0] == 0x00) {
@@ -570,6 +575,47 @@ pub const H3Client = struct {
     pub fn close(self: *H3Client) void {
         self.session.close();
         self.quic.close();
+    }
+
+    /// Configure reconnection parameters.
+    pub fn setReconnectConfig(self: *H3Client, config: client_mod.QuicClient.ReconnectConfig) void {
+        self.quic.setReconnectConfig(config);
+    }
+
+    /// Reconnect after disconnection: fresh QUIC handshake + re-establish H3 control streams.
+    /// Uses 0-RTT resumption if a session ticket is available.
+    pub fn reconnect(self: *H3Client) H3Error!void {
+        // Reset H3-level state
+        self.resetH3State();
+
+        // Reconnect at QUIC level
+        self.quic.reconnect() catch |e| {
+            return switch (e) {
+                ConnectError.Timeout => H3Error.Timeout,
+                ConnectError.SocketError => H3Error.WriteFailed,
+                else => H3Error.WriteFailed,
+            };
+        };
+
+        // Re-establish H3 control streams
+        const streams = self.session.onHandshakeComplete() orelse return H3Error.EncodeFailed;
+
+        try self.writeWithRetry(streams.control_stream_id, streams.control_data[0..streams.control_data_len], false);
+        try self.writeWithRetry(streams.qpack_enc_stream_id, streams.qpack_enc_data[0..streams.qpack_enc_data_len], false);
+        try self.writeWithRetry(streams.qpack_dec_stream_id, streams.qpack_dec_data[0..streams.qpack_dec_data_len], false);
+    }
+
+    /// Check if the reconnect manager has given up retrying.
+    pub fn reconnectGaveUp(self: *const H3Client) bool {
+        return self.quic.reconnect_mgr.state == .gave_up;
+    }
+
+    fn resetH3State(self: *H3Client) void {
+        self.session = Session.init(self.server_name[0..self.server_name_len]);
+        self.session.startHandshake();
+        for (&self.stream_bufs) |*sb| sb.reset();
+        self.server_control_stream_id = null;
+        self.control_parse_pos = 0;
     }
 };
 

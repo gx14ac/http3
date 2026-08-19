@@ -19,6 +19,8 @@ const idle_mod = @import("idle_timeout.zig");
 const cid_mod = @import("cid_manager.zig");
 const retry_mod = @import("retry.zig");
 const migration_mod = @import("migration.zig");
+const ecn_mod = @import("ecn.zig");
+const resumption_mod = @import("resumption.zig");
 
 /// Connection states.
 pub const ConnState = enum {
@@ -89,6 +91,8 @@ pub const Connection = struct {
     server_hello_bytes: [1280]u8,
     server_hello_len: usize,
     x25519_private_key: [32]u8,
+    server_name: [256]u8,
+    server_name_len: u8,
     close_ctrl: conn_close.CloseController,
     loss: loss_mod.LossDetector,
     send_buf: retransmit_mod.SendBuffer,
@@ -105,6 +109,12 @@ pub const Connection = struct {
     path_challenge_sent_us: u64,
     path_validated: bool,
     migration: migration_mod.MigrationManager,
+    ecn_validator: ecn_mod.EcnValidator,
+    master_secret: ?[32]u8,
+    transcript_hash_full: ?[32]u8,
+    post_hs_crypto: handshake_flight.CryptoReassembler,
+    post_hs_crypto_processed: usize,
+    pending_session_ticket: ?resumption_mod.SessionTicket,
 
     /// Legacy init — uses NewReno for backward compatibility with existing tests.
     /// Production code should use QuicClient (which defaults to Cubic via QuicConfig).
@@ -145,6 +155,7 @@ pub const Connection = struct {
         conn.client_hello_len = 0;
         conn.server_hello_len = 0;
         conn.x25519_private_key = [_]u8{0} ** 32;
+        conn.server_name_len = 0;
         conn.close_ctrl = conn_close.CloseController.init();
         conn.loss = loss_mod.LossDetector.initWithAlgo(cc_algo, 0);
         conn.send_buf = retransmit_mod.SendBuffer.init();
@@ -161,8 +172,28 @@ pub const Connection = struct {
         conn.path_challenge_sent_us = 0;
         conn.path_validated = true;
         conn.migration = migration_mod.MigrationManager.init();
+        conn.ecn_validator = ecn_mod.EcnValidator{};
+        conn.master_secret = null;
+        conn.transcript_hash_full = null;
+        conn.post_hs_crypto = handshake_flight.CryptoReassembler.init();
+        conn.post_hs_crypto_processed = 0;
+        conn.pending_session_ticket = null;
 
         return conn;
+    }
+
+    /// Take a pending NewSessionTicket if one was received alongside stream data.
+    /// Callers should check this after each onDatagram() that returned .data_received.
+    pub fn takePendingTicket(self: *Connection) ?resumption_mod.SessionTicket {
+        const ticket = self.pending_session_ticket;
+        self.pending_session_ticket = null;
+        return ticket;
+    }
+
+    pub fn setServerName(self: *Connection, name: []const u8) void {
+        const len: u8 = @intCast(@min(name.len, 256));
+        @memcpy(self.server_name[0..len], name[0..len]);
+        self.server_name_len = len;
     }
 
     /// Set the client's x25519 private key (needed for handshake key derivation).
@@ -893,6 +924,10 @@ pub const Connection = struct {
                     result.application_keys.server_hp,
                 );
 
+                // Store master_secret and full transcript for session resumption
+                self.master_secret = result.master_secret;
+                self.transcript_hash_full = self.transcript.current();
+
                 // Apply peer's transport parameters
                 if (result.peer_transport_params) |peer_tp| {
                     self.setPeerTransportParams(peer_tp.toFlowParams());
@@ -902,6 +937,7 @@ pub const Connection = struct {
                 return .{ .handshake_complete = .{
                     .client_finished_msg = result.client_finished_msg,
                     .client_finished_msg_len = result.client_finished_msg_len,
+                    .early_data_accepted = result.early_data_accepted,
                 } };
             }
         }
@@ -997,12 +1033,25 @@ pub const Connection = struct {
                 self.processAckForRetransmit(scan_result.ack_ranges[0..scan_result.ack_range_count]);
                 self.processLossForRetransmit(&loss_event);
 
+                // ECN validation: feed peer's ECN counts to validator
+                if (scan_result.has_ecn) {
+                    var newly_acked: u64 = scan_result.ack_first_range + 1;
+                    for (scan_result.ack_ranges[0..scan_result.ack_range_count]) |r| {
+                        newly_acked += r.end - r.start + 1;
+                    }
+                    const ce_detected = self.ecn_validator.onAckEcn(scan_result.ecn_counts, newly_acked);
+                    if (ce_detected) {
+                        self.loss.onEcnCongestion(recv_time_us);
+                    }
+                }
+
                 // RFC 9001 §6: confirm key update only when peer ACKs a PN from the new phase
                 _ = km.tryConfirmUpdate(scan_result.ack_largest);
             }
 
             // Process NEW_CONNECTION_ID frames
             self.processNewCids(&scan_result);
+            self.processFlowControlUpdates(&scan_result);
 
             if (scan_result.close_frame) |close_frame| {
                 self.close_ctrl.onPeerClose(recv_time_us, self.getPto());
@@ -1018,6 +1067,12 @@ pub const Connection = struct {
             // PATH_RESPONSE completes our path validation
             if (scan_result.path_response_data) |response_data| {
                 self.onPathResponse(response_data);
+            }
+
+            // Feed post-handshake CRYPTO data to reassembler
+            self.feedPostHsCrypto(out_buf[0..pt_len], &scan_result);
+            if (self.tryExtractSessionTicket(self.server_name[0..self.server_name_len], @intCast(@divTrunc(recv_time_us, 1000)))) |ticket| {
+                self.pending_session_ticket = ticket;
             }
 
             return .{ .data_received = out_buf[0..pt_len] };
@@ -1051,10 +1106,22 @@ pub const Connection = struct {
             );
             self.processAckForRetransmit(scan_result.ack_ranges[0..scan_result.ack_range_count]);
             self.processLossForRetransmit(&loss_event);
+
+            if (scan_result.has_ecn) {
+                var newly_acked: u64 = scan_result.ack_first_range + 1;
+                for (scan_result.ack_ranges[0..scan_result.ack_range_count]) |r| {
+                    newly_acked += r.end - r.start + 1;
+                }
+                const ce_detected = self.ecn_validator.onAckEcn(scan_result.ecn_counts, newly_acked);
+                if (ce_detected) {
+                    self.loss.onEcnCongestion(recv_time_us);
+                }
+            }
         }
 
         // Process NEW_CONNECTION_ID frames
         self.processNewCids(&scan_result);
+        self.processFlowControlUpdates(&scan_result);
 
         if (scan_result.close_frame) |close_frame| {
             self.close_ctrl.onPeerClose(recv_time_us, self.getPto());
@@ -1070,7 +1137,73 @@ pub const Connection = struct {
             self.onPathResponse(response_data);
         }
 
+        self.feedPostHsCrypto(decoded.plaintext, &scan_result);
+        if (self.tryExtractSessionTicket(self.server_name[0..self.server_name_len], @intCast(@divTrunc(recv_time_us, 1000)))) |ticket| {
+            self.pending_session_ticket = ticket;
+        }
+
         return .{ .data_received = decoded.plaintext };
+    }
+
+    fn processFlowControlUpdates(self: *Connection, scan_result: *const PayloadScanResult) void {
+        if (scan_result.max_data) |max| {
+            self.stream_mgr.flow.onMaxData(max);
+        }
+        for (scan_result.max_stream_data[0..scan_result.max_stream_data_count]) |update| {
+            self.stream_mgr.flow.onMaxStreamData(update.stream_id, update.max);
+        }
+    }
+
+    fn feedPostHsCrypto(self: *Connection, plaintext: []const u8, scan_result: *const PayloadScanResult) void {
+        for (scan_result.crypto_fragments[0..scan_result.crypto_fragment_count]) |frag| {
+            const data = plaintext[frag.data_start..][0..frag.data_len];
+            _ = self.post_hs_crypto.insert(frag.offset, data);
+        }
+    }
+
+    fn tryExtractSessionTicket(self: *Connection, server_name: []const u8, now_ms: i64) ?resumption_mod.SessionTicket {
+        const master = self.master_secret orelse return null;
+        const transcript_full = self.transcript_hash_full orelse return null;
+
+        const crypto_data = self.post_hs_crypto.getData();
+        var result: ?resumption_mod.SessionTicket = null;
+
+        while (true) {
+            if (crypto_data.len <= self.post_hs_crypto_processed) break;
+            const unprocessed = crypto_data[self.post_hs_crypto_processed..];
+            if (unprocessed.len < 4) break;
+
+            const msg_len: usize = (@as(usize, unprocessed[1]) << 16) | (@as(usize, unprocessed[2]) << 8) | unprocessed[3];
+            const total = 4 + msg_len;
+            if (unprocessed.len < total) break;
+
+            if (unprocessed[0] != 0x04) {
+                self.post_hs_crypto_processed += total;
+                continue;
+            }
+
+            self.post_hs_crypto_processed += total;
+            const parsed = resumption_mod.parseNewSessionTicket(unprocessed[4..total]) orelse continue;
+
+            const rms = resumption_mod.deriveResumptionMasterSecret(master, transcript_full);
+            const psk = resumption_mod.computePsk(rms, parsed.nonce[0..parsed.nonce_len]);
+
+            var ticket: resumption_mod.SessionTicket = undefined;
+            ticket.ticket_lifetime = parsed.lifetime;
+            ticket.ticket_age_add = parsed.age_add;
+            ticket.ticket_nonce_len = parsed.nonce_len;
+            ticket.ticket_nonce = parsed.nonce;
+            ticket.ticket_len = parsed.ticket_len;
+            ticket.ticket = parsed.ticket;
+            ticket.max_early_data_size = parsed.max_early_data_size;
+            ticket.psk = psk;
+            ticket.received_at_ms = now_ms;
+            ticket.server_name_len = @intCast(@min(server_name.len, 256));
+            @memcpy(ticket.server_name[0..ticket.server_name_len], server_name[0..ticket.server_name_len]);
+            result = ticket;
+        }
+
+        return result;
     }
 
     fn processNewCids(self: *Connection, scan_result: *const PayloadScanResult) void {
@@ -1086,18 +1219,34 @@ pub const Connection = struct {
 
     /// Result of scanning a decrypted payload for ACK and CONNECTION_CLOSE frames.
     const PayloadScanResult = struct {
+        const MAX_CRYPTO_FRAGMENTS = 4;
+        const CryptoFragmentMeta = struct {
+            offset: u64,
+            data_start: usize,
+            data_len: usize,
+        };
+
         has_ack: bool = false,
         ack_largest: u64 = 0,
         ack_first_range: u64 = 0,
         ack_delay: u64 = 0,
         ack_ranges: [MAX_ACK_RANGES]AckRange = [_]AckRange{.{ .start = 0, .end = 0 }} ** MAX_ACK_RANGES,
         ack_range_count: usize = 0,
+        has_ecn: bool = false,
+        ecn_counts: ecn_mod.EcnCounts = .{},
         close_frame: ?conn_close.ConnectionCloseFrame = null,
         new_cids: [MAX_NEW_CIDS]cid_mod.NewConnectionIdFrame = undefined,
         new_cid_count: usize = 0,
         has_handshake_done: bool = false,
         path_challenge_data: ?[8]u8 = null,
         path_response_data: ?[8]u8 = null,
+        crypto_fragments: [MAX_CRYPTO_FRAGMENTS]CryptoFragmentMeta = undefined,
+        crypto_fragment_count: usize = 0,
+        max_data: ?u64 = null,
+        max_stream_data: [MAX_FC_UPDATES]struct { stream_id: u62, max: u64 } = undefined,
+        max_stream_data_count: usize = 0,
+
+        const MAX_FC_UPDATES = 8;
     };
 
     /// Scan a decrypted payload, extracting ACK info and CONNECTION_CLOSE.
@@ -1159,7 +1308,7 @@ pub const Connection = struct {
                         smallest = range_start;
                     }
 
-                    // ECN counts for type 0x03
+                    // ECN counts for type 0x03 (ACK_ECN)
                     if (ft_byte == 0x03) {
                         const ect0 = packet_mod.decodeVarint(plaintext[pos..]) orelse return result;
                         pos += ect0.consumed;
@@ -1167,6 +1316,12 @@ pub const Connection = struct {
                         pos += ect1.consumed;
                         const ecn_ce = packet_mod.decodeVarint(plaintext[pos..]) orelse return result;
                         pos += ecn_ce.consumed;
+                        result.has_ecn = true;
+                        result.ecn_counts = .{
+                            .ect0 = ect0.value,
+                            .ect1 = ect1.value,
+                            .ce = ecn_ce.value,
+                        };
                     }
                 },
                 0x04 => {
@@ -1190,11 +1345,20 @@ pub const Connection = struct {
                 0x06 => {
                     // CRYPTO: offset + length + data
                     pos += 1;
-                    const offset = packet_mod.decodeVarint(plaintext[pos..]) orelse return result;
-                    pos += offset.consumed;
+                    const crypto_offset = packet_mod.decodeVarint(plaintext[pos..]) orelse return result;
+                    pos += crypto_offset.consumed;
                     const length = packet_mod.decodeVarint(plaintext[pos..]) orelse return result;
                     pos += length.consumed;
-                    pos += @intCast(length.value);
+                    const crypto_len: usize = @intCast(length.value);
+                    if (crypto_len > 0 and pos + crypto_len <= plaintext.len and result.crypto_fragment_count < PayloadScanResult.MAX_CRYPTO_FRAGMENTS) {
+                        result.crypto_fragments[result.crypto_fragment_count] = .{
+                            .offset = crypto_offset.value,
+                            .data_start = pos,
+                            .data_len = crypto_len,
+                        };
+                        result.crypto_fragment_count += 1;
+                    }
+                    pos += crypto_len;
                 },
                 0x07 => {
                     // NEW_TOKEN: token_length + token
@@ -1230,6 +1394,7 @@ pub const Connection = struct {
                     pos += 1;
                     const v = packet_mod.decodeVarint(plaintext[pos..]) orelse return result;
                     pos += v.consumed;
+                    result.max_data = v.value;
                 },
                 0x11 => {
                     // MAX_STREAM_DATA: stream_id + max_data
@@ -1238,6 +1403,13 @@ pub const Connection = struct {
                     pos += v1.consumed;
                     const v2 = packet_mod.decodeVarint(plaintext[pos..]) orelse return result;
                     pos += v2.consumed;
+                    if (result.max_stream_data_count < PayloadScanResult.MAX_FC_UPDATES) {
+                        result.max_stream_data[result.max_stream_data_count] = .{
+                            .stream_id = @intCast(v1.value),
+                            .max = v2.value,
+                        };
+                        result.max_stream_data_count += 1;
+                    }
                 },
                 0x12, 0x13 => {
                     // MAX_STREAMS: max_streams
@@ -1330,6 +1502,7 @@ pub const ConnectionEvent = union(enum) {
     handshake_complete: struct {
         client_finished_msg: [36]u8,
         client_finished_msg_len: usize,
+        early_data_accepted: bool,
     },
     data_received: []const u8,
     /// Peer sent CONNECTION_CLOSE. Connection is now draining.
@@ -1347,6 +1520,8 @@ pub const ConnectionEvent = union(enum) {
     },
     /// Peer sent HTTP/3 GOAWAY. last_stream_id = last stream peer will process.
     goaway: u62,
+    /// Server sent NewSessionTicket — caller should store for 0-RTT resumption.
+    new_session_ticket: resumption_mod.SessionTicket,
 };
 
 // ─── Tests ───
@@ -2560,4 +2735,120 @@ test "Connection: disableMigration prevents migration events" {
     const ev = conn.onDatagramSource(addr2, 1200, 1_000_000);
     try std.testing.expect(ev == .none);
     try std.testing.expect(!conn.isMigrationInProgress());
+}
+
+test "Connection: multi-fragment post-handshake CRYPTO reassembly" {
+    const dcid = [_]u8{0x01} ** 8;
+    const scid = [_]u8{0x02} ** 4;
+    var conn = Connection.init(&dcid, &scid);
+    conn.state = .connected;
+    conn.master_secret = [_]u8{0xAA} ** 32;
+    conn.transcript_hash_full = [_]u8{0xBB} ** 32;
+
+    // Build a NewSessionTicket TLS message split into two fragments.
+    // TLS header: type=0x04, length=16 (3 bytes big-endian)
+    // Payload: lifetime(4) + age_add(4) + nonce_len(1=0) + ticket_len(2=2) + ticket(2) + ext_len(2=0) = 15 bytes
+    // Total TLS message = 4 + 15 = 19 bytes
+    var nst_msg: [19]u8 = undefined;
+    nst_msg[0] = 0x04; // type
+    nst_msg[1] = 0;
+    nst_msg[2] = 0;
+    nst_msg[3] = 15; // length=15
+    std.mem.writeInt(u32, nst_msg[4..8], 7200, .big); // lifetime
+    std.mem.writeInt(u32, nst_msg[8..12], 0x12345678, .big); // age_add
+    nst_msg[12] = 0; // nonce_len=0
+    std.mem.writeInt(u16, nst_msg[13..15], 2, .big); // ticket_len=2
+    nst_msg[15] = 'T';
+    nst_msg[16] = 'K'; // ticket="TK"
+    std.mem.writeInt(u16, nst_msg[17..19], 0, .big); // extensions_len=0
+
+    // Fragment 1: first 10 bytes at offset 0
+    _ = conn.post_hs_crypto.insert(0, nst_msg[0..10]);
+    // Try extraction — should fail (incomplete)
+    try std.testing.expect(conn.tryExtractSessionTicket("test.com", 1000) == null);
+
+    // Fragment 2: remaining 9 bytes at offset 10
+    _ = conn.post_hs_crypto.insert(10, nst_msg[10..19]);
+    // Now extraction should succeed
+    const ticket = conn.tryExtractSessionTicket("test.com", 1000) orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 7200), ticket.ticket_lifetime);
+    try std.testing.expectEqual(@as(u32, 0x12345678), ticket.ticket_age_add);
+    try std.testing.expectEqual(@as(u16, 2), ticket.ticket_len);
+    try std.testing.expectEqualSlices(u8, "TK", ticket.ticket[0..2]);
+    try std.testing.expectEqualSlices(u8, "test.com", ticket.server_name[0..ticket.server_name_len]);
+}
+
+test "Connection: multiple CRYPTO frames in single packet" {
+    const dcid = [_]u8{0x01} ** 8;
+    const scid = [_]u8{0x02} ** 4;
+    var conn = Connection.init(&dcid, &scid);
+    conn.state = .connected;
+    conn.master_secret = [_]u8{0xAA} ** 32;
+    conn.transcript_hash_full = [_]u8{0xBB} ** 32;
+
+    // Build two NSTs: each 19 bytes (same structure as above)
+    var nst1: [19]u8 = undefined;
+    nst1[0] = 0x04;
+    nst1[1] = 0;
+    nst1[2] = 0;
+    nst1[3] = 15;
+    std.mem.writeInt(u32, nst1[4..8], 3600, .big);
+    std.mem.writeInt(u32, nst1[8..12], 0xAAAAAAAA, .big);
+    nst1[12] = 0;
+    std.mem.writeInt(u16, nst1[13..15], 2, .big);
+    nst1[15] = 'A';
+    nst1[16] = '1';
+    std.mem.writeInt(u16, nst1[17..19], 0, .big);
+
+    var nst2: [19]u8 = undefined;
+    nst2[0] = 0x04;
+    nst2[1] = 0;
+    nst2[2] = 0;
+    nst2[3] = 15;
+    std.mem.writeInt(u32, nst2[4..8], 7200, .big);
+    std.mem.writeInt(u32, nst2[8..12], 0xBBBBBBBB, .big);
+    nst2[12] = 0;
+    std.mem.writeInt(u16, nst2[13..15], 2, .big);
+    nst2[15] = 'B';
+    nst2[16] = '2';
+    std.mem.writeInt(u16, nst2[17..19], 0, .big);
+
+    // Simulate a packet with two CRYPTO frames carrying NST1 at offset=0 and NST2 at offset=19
+    // Build plaintext: [CRYPTO frame 1][CRYPTO frame 2]
+    var plaintext: [64]u8 = undefined;
+    var pos: usize = 0;
+    // CRYPTO frame 1: type=0x06, offset=0 (1 byte varint), length=19 (1 byte varint), data
+    plaintext[pos] = 0x06;
+    pos += 1;
+    plaintext[pos] = 0x00; // offset=0
+    pos += 1;
+    plaintext[pos] = 19; // length=19
+    pos += 1;
+    @memcpy(plaintext[pos..][0..19], &nst1);
+    pos += 19;
+    // CRYPTO frame 2: type=0x06, offset=19, length=19, data
+    plaintext[pos] = 0x06;
+    pos += 1;
+    plaintext[pos] = 19; // offset=19
+    pos += 1;
+    plaintext[pos] = 19; // length=19
+    pos += 1;
+    @memcpy(plaintext[pos..][0..19], &nst2);
+    pos += 19;
+
+    const scan_result = Connection.scanPayload(plaintext[0..pos]);
+    try std.testing.expectEqual(@as(usize, 2), scan_result.crypto_fragment_count);
+    try std.testing.expectEqual(@as(u64, 0), scan_result.crypto_fragments[0].offset);
+    try std.testing.expectEqual(@as(u64, 19), scan_result.crypto_fragments[1].offset);
+
+    // Feed both fragments via feedPostHsCrypto
+    conn.feedPostHsCrypto(plaintext[0..pos], &scan_result);
+
+    // tryExtractSessionTicket should process both and return the last one
+    const ticket = conn.tryExtractSessionTicket("srv", 2000) orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 7200), ticket.ticket_lifetime);
+    try std.testing.expectEqual(@as(u32, 0xBBBBBBBB), ticket.ticket_age_add);
+    try std.testing.expectEqualSlices(u8, "B2", ticket.ticket[0..2]);
+    // Verify both messages were consumed
+    try std.testing.expectEqual(@as(usize, 38), conn.post_hs_crypto_processed);
 }
