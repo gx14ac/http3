@@ -202,6 +202,9 @@ pub const QuicClient = struct {
                 // Process pending ACKs
                 self.sendPendingAcks(recv_now);
 
+                // Retransmit any frames that were declared lost during ACK processing
+                self.processRetransmits(recv_now);
+
                 // Update underutilized state
                 self.updateUnderutilized(recv_now);
 

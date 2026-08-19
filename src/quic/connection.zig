@@ -708,8 +708,11 @@ pub const Connection = struct {
     }
 
     /// Called when the loss detection timer fires. Returns level for PTO probe, if any.
+    /// Also moves any time-based lost frames into the retransmit queue.
     pub fn onLossTimeout(self: *Connection, now_us: u64) ?ack_mod.EncryptionLevel {
-        return self.loss.onLossDetectionTimeout(now_us);
+        const result = self.loss.onLossDetectionTimeout(now_us);
+        self.processLossForRetransmit(&result.loss_event);
+        return result.pto_level;
     }
 
     /// Discard a crypto level's loss state (e.g., Initial keys discarded after handshake).
@@ -781,13 +784,9 @@ pub const Connection = struct {
         }
     }
 
-    /// Public: call after onLossTimeout to move any newly-lost frames into the retransmit queue.
-    /// The loss detector already ran detectLostPackets; this drains pending loss into rtx_queue.
+    /// No-op: retained for API compatibility. Loss → retransmit is now handled
+    /// inside onLossTimeout (time-based) and handleShortHeader (ACK-based).
     pub fn processLoss(self: *Connection) void {
-        // Loss detection is handled inside onLossDetectionTimeout/onAckReceived.
-        // This is a no-op hook; the retransmit queue is populated by processLossForRetransmit
-        // which is called from handleShortHeader after ACK processing.
-        // For timeout-driven loss, the caller should use retransmitNext directly.
         _ = self;
     }
 
@@ -2141,6 +2140,47 @@ test "Connection: sendStream → loss → retransmit cycle" {
 
     const rtx_len2 = conn.retransmitNext(&buf, 2_001_000) orelse unreachable;
     try std.testing.expect(rtx_len2 > 0);
+    try std.testing.expect(!conn.hasRetransmits());
+}
+
+test "Connection: onLossTimeout time-based loss moves to retransmit queue" {
+    const dcid = [_]u8{0x01} ** 8;
+    const scid = [_]u8{0x02} ** 4;
+    var conn = Connection.init(&dcid, &scid);
+    conn.keys.app_client = .{
+        .key = [_]u8{0x11} ** 16,
+        .iv = [_]u8{0x22} ** 12,
+        .hp = [_]u8{0x33} ** 16,
+    };
+    conn.state = .connected;
+
+    var buf: [256]u8 = undefined;
+
+    // Get an RTT sample first
+    _ = conn.sendStream(&buf, 4, 0, "rtt", false, 1_000_000) orelse unreachable;
+    _ = conn.loss.onAckReceived(.application, 0, 0, 0, 1_100_000);
+
+    // Send two STREAM frames
+    _ = conn.sendStream(&buf, 4, 3, "aaa", false, 2_000_000) orelse unreachable;
+    _ = conn.sendStream(&buf, 4, 6, "bbb", false, 2_001_000) orelse unreachable;
+    try std.testing.expectEqual(@as(usize, 2), conn.send_buf.pending());
+
+    // ACK only the second (PN 2) → PN 1 is within time threshold territory
+    _ = conn.loss.onAckReceived(.application, 2, 0, 0, 2_100_000);
+    conn.send_buf.onAckRange(2, 2);
+
+    // The loss timer should be set for time-based loss of PN 1
+    const timer = conn.getLossTimer() orelse unreachable;
+    try std.testing.expect(timer > 2_100_000);
+
+    // Fire the timer → PN 1 should be declared lost and moved to retransmit queue
+    const level = conn.onLossTimeout(timer);
+    try std.testing.expect(level == null); // time-based loss, not PTO
+    try std.testing.expect(conn.hasRetransmits());
+
+    // Verify we can retransmit
+    const rtx_len = conn.retransmitNext(&buf, timer + 1000) orelse unreachable;
+    try std.testing.expect(rtx_len > 0);
     try std.testing.expect(!conn.hasRetransmits());
 }
 

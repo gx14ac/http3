@@ -897,16 +897,23 @@ pub const LossDetector = struct {
         return self.receiveAckEnd(level, ack_delay_us, now_us);
     }
 
+    /// Result of a loss detection timeout.
+    pub const TimeoutResult = struct {
+        pto_level: ?ack_mod.EncryptionLevel,
+        loss_event: LossEvent,
+    };
+
     /// Called when the loss detection timer expires.
-    pub fn onLossDetectionTimeout(self: *LossDetector, now_us: u64) ?ack_mod.EncryptionLevel {
+    /// Returns the PTO probe level (if PTO fired) and any time-based loss events.
+    pub fn onLossDetectionTimeout(self: *LossDetector, now_us: u64) TimeoutResult {
         // Check for time-based loss first
         for (0..NUMBER_SPACE_COUNT) |idx| {
             if (self.levels[idx].loss_time_us) |loss_time| {
                 if (now_us >= loss_time) {
-                    _ = self.detectLostPackets(idx, now_us);
+                    const event = self.detectLostPackets(idx, now_us);
                     self.cc.packetBatchEnd(now_us, idx, &self.rtt, self.max_ack_delay_us);
                     self.setLossDetectionTimer(now_us);
-                    return null;
+                    return .{ .pto_level = null, .loss_event = event };
                 }
             }
         }
@@ -915,21 +922,14 @@ pub const LossDetector = struct {
         self.pto_count += 1;
         self.pto_expired = true;
 
-        if (self.levels[0].sent.hasAckElicitingInFlight()) {
-            self.setLossDetectionTimer(now_us);
-            return .initial;
-        }
-        if (self.levels[1].sent.hasAckElicitingInFlight()) {
-            self.setLossDetectionTimer(now_us);
-            return .handshake;
-        }
-        if (self.levels[2].sent.hasAckElicitingInFlight()) {
-            self.setLossDetectionTimer(now_us);
-            return .application;
-        }
+        const level: ack_mod.EncryptionLevel = blk: {
+            if (self.levels[0].sent.hasAckElicitingInFlight()) break :blk .initial;
+            if (self.levels[1].sent.hasAckElicitingInFlight()) break :blk .handshake;
+            break :blk .application;
+        };
 
         self.setLossDetectionTimer(now_us);
-        return .application;
+        return .{ .pto_level = level, .loss_event = LossEvent.init() };
     }
 
     /// Get the current loss detection timer deadline.
