@@ -799,15 +799,32 @@ pub const Connection = struct {
     /// Returns bytes written to buf, or null if queue empty / CC blocks / no keys.
     pub fn retransmitNext(self: *Connection, buf: []u8, now_us: u64) ?usize {
         const frame = self.rtx_queue.dequeue() orelse return null;
-        return self.sendStream(buf, frame.stream_id, frame.offset, frame.data(), frame.fin, now_us);
+        const len = self.sendStream(buf, frame.stream_id, frame.offset, frame.data(), frame.fin, now_us) orelse {
+            _ = self.rtx_queue.enqueue(frame.stream_id, frame.offset, frame.data(), frame.fin);
+            return null;
+        };
+        return len;
     }
 
     /// Build a PTO probe packet. Uses retransmit queue if available, otherwise PING.
     /// Returns bytes written to buf.
     pub fn sendProbe(self: *Connection, buf: []u8, now_us: u64) ?usize {
-        var probe_buf: [64]u8 = undefined;
-        const probe_len = retransmit_mod.ProbeGenerator.buildProbe(&self.rtx_queue, &probe_buf) orelse return null;
-        const result = self.sendTracked(buf, probe_buf[0..probe_len], now_us) orelse return null;
+        if (self.rtx_queue.dequeue()) |frame| {
+            var probe_buf: [1280]u8 = undefined;
+            const probe_len = frame.encode(&probe_buf) orelse {
+                _ = self.rtx_queue.enqueue(frame.stream_id, frame.offset, frame.data(), frame.fin);
+                return null;
+            };
+            const result = self.sendTracked(buf, probe_buf[0..probe_len], now_us) orelse {
+                _ = self.rtx_queue.enqueue(frame.stream_id, frame.offset, frame.data(), frame.fin);
+                return null;
+            };
+            return result.len;
+        }
+        // No retransmit pending — send PING as probe
+        var ping_buf: [64]u8 = undefined;
+        const ping_len = retransmit_mod.ProbeGenerator.buildPingFrame(&ping_buf) orelse return null;
+        const result = self.sendTracked(buf, ping_buf[0..ping_len], now_us) orelse return null;
         return result.len;
     }
 
@@ -1001,7 +1018,7 @@ pub const Connection = struct {
         if (self.key_mgr) |*km| {
             // Key-update-aware decode: HP removal then try decrypt with phase detection
             const hp = km.server_hp;
-            const parsed = short_header.removeHpAndParse(data, self.dcid_len, hp) orelse return .none;
+            const parsed = short_header.removeHpAndParse(data, self.scid_len, hp) orelse return .none;
 
             const pt_len = km.tryDecrypt(
                 &out_buf,
@@ -2159,6 +2176,7 @@ test "Connection: onLossTimeout time-based loss moves to retransmit queue" {
     // Get an RTT sample first
     _ = conn.sendStream(&buf, 4, 0, "rtt", false, 1_000_000) orelse unreachable;
     _ = conn.loss.onAckReceived(.application, 0, 0, 0, 1_100_000);
+    conn.send_buf.onAckPn(0);
 
     // Send two STREAM frames
     _ = conn.sendStream(&buf, 4, 3, "aaa", false, 2_000_000) orelse unreachable;
