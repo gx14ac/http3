@@ -758,15 +758,32 @@ pub const ServerTicketStore = struct {
         };
     }
 
-    /// Store a ticket → PSK mapping.
+    /// Store a ticket → PSK mapping. Evicts expired entries first, then oldest.
     pub fn store(self: *ServerTicketStore, ticket_value: []const u8, psk: [32]u8, issued_at_ms: i64, lifetime_s: u32) void {
         var target: usize = 0;
+        var oldest_time: i64 = std.math.maxInt(i64);
+        var found_slot = false;
         for (&self.entries, 0..) |*e, i| {
             if (e.* == null) {
                 target = i;
+                found_slot = true;
                 break;
             }
-            target = i; // overwrite last slot if full
+            // Prefer evicting expired entries
+            const age_ms = issued_at_ms - e.*.?.issued_at_ms;
+            if (age_ms > @as(i64, e.*.?.lifetime_s) * 1000) {
+                target = i;
+                found_slot = true;
+                break;
+            }
+            // Track oldest for LRU eviction
+            if (e.*.?.issued_at_ms < oldest_time) {
+                oldest_time = e.*.?.issued_at_ms;
+                target = i;
+            }
+        }
+        if (!found_slot) {
+            // All slots occupied and none expired — evict the oldest (target set above)
         }
         var entry: TicketEntry = undefined;
         entry.ticket_len = @intCast(@min(ticket_value.len, 256));
@@ -799,7 +816,7 @@ pub const ServerTicketStore = struct {
 /// and stores the ticket → PSK mapping in the ticket store.
 /// Returns the number of bytes written to `out_buf`, or null on failure.
 pub fn issueNewSessionTicket(
-    state: *const ServerHandshakeState,
+    master_secret: [32]u8,
     transcript_hash_full: [32]u8,
     ticket_store: *ServerTicketStore,
     out_buf: []u8,
@@ -808,17 +825,15 @@ pub fn issueNewSessionTicket(
     const resumption = @import("resumption.zig");
 
     const rms = resumption.deriveResumptionMasterSecret(
-        state.app_keys.master_secret,
+        master_secret,
         transcript_hash_full,
     );
 
-    // Generate ticket nonce and value
     var ticket_nonce: [8]u8 = undefined;
     crypto.random.bytes(&ticket_nonce);
     var ticket_value: [32]u8 = undefined;
     crypto.random.bytes(&ticket_value);
 
-    // Compute PSK = HKDF-Expand-Label(rms, "resumption", nonce)
     const psk = resumption.computePsk(rms, &ticket_nonce);
 
     const lifetime: u32 = 7200; // 2 hours
@@ -826,10 +841,8 @@ pub fn issueNewSessionTicket(
     crypto.random.bytes(&ticket_age_add);
     const age_add = std.mem.readInt(u32, &ticket_age_add, .big);
 
-    // Store in server's ticket store
     ticket_store.store(&ticket_value, psk, issued_at_ms, lifetime);
 
-    // Build the TLS NewSessionTicket message
     return buildNewSessionTicket(
         out_buf,
         lifetime,

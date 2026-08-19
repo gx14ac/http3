@@ -203,7 +203,7 @@ pub const QuicServer = struct {
             if (data.len >= 1 and data[0] & 0x80 != 0) {
                 const ptype_new: u2 = @intCast((data[0] >> 4) & 0x03);
                 if (ptype_new == @intFromEnum(packet_mod.PacketType.zero_rtt)) {
-                    // 0-RTT before connection is established — buffer for later
+                    // TODO: buffer 0-RTT packets and decrypt after PSK validation
                     return .none;
                 }
                 return self.handleInitial(data, &src_addr);
@@ -790,40 +790,20 @@ pub const QuicServer = struct {
         const master_secret = self.conns[ci].master_secret orelse return;
         const transcript_sf = self.conns[ci].transcript_after_server_finished orelse return;
 
-        // Build the NewSessionTicket TLS message
-        const resumption = @import("resumption.zig");
-        const rms = resumption.deriveResumptionMasterSecret(master_secret, transcript_sf);
-
-        var ticket_nonce: [8]u8 = undefined;
-        crypto.random.bytes(&ticket_nonce);
-        var ticket_value: [32]u8 = undefined;
-        crypto.random.bytes(&ticket_value);
-
-        const psk = resumption.computePsk(rms, &ticket_nonce);
-
-        const lifetime: u32 = 7200;
-        var age_add_bytes: [4]u8 = undefined;
-        crypto.random.bytes(&age_add_bytes);
-        const age_add = std.mem.readInt(u32, &age_add_bytes, .big);
-
-        // Store in ticket store
-        self.ticket_store.store(&ticket_value, psk, std.time.milliTimestamp(), lifetime);
-
-        // Build the TLS message
+        // Issue ticket via the unified helper
         var nst_buf: [256]u8 = undefined;
-        const nst_len = server_hs.buildNewSessionTicket(
+        const nst_len = server_hs.issueNewSessionTicket(
+            master_secret,
+            transcript_sf,
+            &self.ticket_store,
             &nst_buf,
-            lifetime,
-            age_add,
-            &ticket_nonce,
-            &ticket_value,
-            0x4000,
+            std.time.milliTimestamp(),
         ) orelse return;
 
         // Wrap in a CRYPTO frame and send as 1-RTT
         var frame_buf: [512]u8 = undefined;
         var fpos: usize = 0;
-        frame_buf[fpos] = 0x06; // CRYPTO frame type
+        frame_buf[fpos] = 0x06;
         fpos += 1;
         fpos += packet_mod.encodeVarint(frame_buf[fpos..], 0) orelse return;
         fpos += packet_mod.encodeVarint(frame_buf[fpos..], nst_len) orelse return;
