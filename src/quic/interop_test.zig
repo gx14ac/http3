@@ -258,6 +258,105 @@ test "interop-local: multiple H3 requests reuse connection" {
     server_thread.join();
 }
 
+// ─── Test: concurrent multiplexed requests ───
+
+fn h3ServerConcurrentLoop(server: *H3Server) void {
+    server.setTimeout(500);
+    var requests_served: usize = 0;
+    var iterations: usize = 0;
+    while (iterations < 200 and requests_served < 3) : (iterations += 1) {
+        const event = server.poll();
+        switch (event) {
+            .request => |req| {
+                // Echo back the path as body so client can distinguish responses
+                const path = req.pathSlice();
+                server.sendResponse(req.conn_idx, req.stream_id, 200, &.{}, path) catch continue;
+                requests_served += 1;
+            },
+            .connected => continue,
+            .none => continue,
+            .timeout => continue,
+            .data => continue,
+        }
+    }
+}
+
+test "interop-local: concurrent multiplexed H3 requests" {
+    const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = H3Server.init(bind_addr, .{}) catch return;
+    defer server.deinit();
+    const port = server.getPort();
+
+    const server_thread = std.Thread.spawn(.{}, h3ServerConcurrentLoop, .{&server}) catch return;
+
+    const server_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    var h3 = H3Client.init(server_addr, "localhost") catch {
+        server_thread.join();
+        return;
+    };
+    defer h3.deinit();
+
+    h3.connect() catch {
+        server_thread.join();
+        return;
+    };
+
+    // Submit 3 requests concurrently (non-blocking)
+    const s1 = h3.submitRequest("GET", "/alpha", &.{}, null) catch {
+        h3.close();
+        server_thread.join();
+        return;
+    };
+    const s2 = h3.submitRequest("GET", "/beta", &.{}, null) catch {
+        h3.close();
+        server_thread.join();
+        return;
+    };
+    const s3 = h3.submitRequest("GET", "/gamma", &.{}, null) catch {
+        h3.close();
+        server_thread.join();
+        return;
+    };
+
+    // All three should be in flight
+    try std.testing.expectEqual(@as(usize, 3), h3.inFlightCount());
+
+    // Stream IDs should be distinct
+    try std.testing.expect(s1 != s2);
+    try std.testing.expect(s2 != s3);
+    try std.testing.expect(s1 != s3);
+
+    // Poll until all 3 responses arrive
+    var received: [3]bool = .{ false, false, false };
+    var iterations: usize = 0;
+    while (iterations < 100) : (iterations += 1) {
+        const ev = h3.pollEvent();
+        switch (ev) {
+            .response_ready => |sid| {
+                const resp = h3.takeResponse(sid) catch continue;
+                if (sid == s1) {
+                    try std.testing.expectEqualStrings("/alpha", resp.bodySlice());
+                    received[0] = true;
+                } else if (sid == s2) {
+                    try std.testing.expectEqualStrings("/beta", resp.bodySlice());
+                    received[1] = true;
+                } else if (sid == s3) {
+                    try std.testing.expectEqualStrings("/gamma", resp.bodySlice());
+                    received[2] = true;
+                }
+                if (received[0] and received[1] and received[2]) break;
+            },
+            .closed => break,
+            .none => {},
+        }
+    }
+
+    try std.testing.expect(received[0] and received[1] and received[2]);
+
+    h3.close();
+    server_thread.join();
+}
+
 // ─── Test: graceful connection close ───
 
 test "interop-local: graceful close with CONNECTION_CLOSE" {

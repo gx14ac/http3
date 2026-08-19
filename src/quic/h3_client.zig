@@ -572,6 +572,103 @@ pub const H3Client = struct {
         return self.session.h3.goaway_id;
     }
 
+    // ─── Multiplexed (non-blocking) request API ───
+
+    /// Submit a request without waiting for the response.
+    /// Returns the stream ID which can later be used with takeResponse().
+    /// Multiple requests can be submitted before polling for responses.
+    pub fn submitRequest(
+        self: *H3Client,
+        method: []const u8,
+        path: []const u8,
+        extra_headers: []const qpack.HeaderField,
+        body: ?[]const u8,
+    ) H3Error!u62 {
+        if (!self.quic.isConnected()) return H3Error.NotConnected;
+
+        var all_headers: [36]qpack.HeaderField = undefined;
+        var hdr_count: usize = 0;
+
+        all_headers[hdr_count] = .{ .name = ":method", .value = method };
+        hdr_count += 1;
+        all_headers[hdr_count] = .{ .name = ":scheme", .value = "https" };
+        hdr_count += 1;
+        all_headers[hdr_count] = .{ .name = ":authority", .value = self.server_name[0..self.server_name_len] };
+        hdr_count += 1;
+        all_headers[hdr_count] = .{ .name = ":path", .value = path };
+        hdr_count += 1;
+
+        for (extra_headers) |h| {
+            if (hdr_count >= all_headers.len) break;
+            all_headers[hdr_count] = h;
+            hdr_count += 1;
+        }
+
+        const req = self.session.sendRequest(all_headers[0..hdr_count], body) orelse
+            return H3Error.SessionFull;
+
+        _ = self.allocStreamBuf(req.stream_id) orelse return H3Error.SessionFull;
+
+        try self.writeWithRetry(req.stream_id, req.headers_frame[0..req.headers_frame_len], !req.has_body);
+
+        if (req.has_body) {
+            try self.writeWithRetry(req.stream_id, req.data_frame[0..req.data_frame_len], true);
+        }
+
+        return req.stream_id;
+    }
+
+    /// Result of a single poll cycle for multiplexed requests.
+    pub const PollEvent = union(enum) {
+        none,
+        response_ready: u62,
+        closed,
+    };
+
+    /// Drive the connection: process one round of incoming data.
+    /// Returns .response_ready with the stream_id if any request's response is complete.
+    /// Call repeatedly in a loop to process all in-flight requests.
+    pub fn pollEvent(self: *H3Client) PollEvent {
+        const poll_result = self.quic.poll();
+        switch (poll_result) {
+            .received => {
+                const payload = self.quic.lastStreamData();
+                if (payload.len > 0) {
+                    self.feedPayload(payload);
+                }
+                // Check all active streams for completion
+                for (&self.stream_bufs) |*sb| {
+                    if (sb.stream_id) |sid| {
+                        if (self.isResponseComplete(sid)) {
+                            return .{ .response_ready = sid };
+                        }
+                    }
+                }
+                return .none;
+            },
+            .closed => return .closed,
+            .connected, .timeout, .idle => return .none,
+        }
+    }
+
+    /// Take a completed response for the given stream ID.
+    /// Only valid after pollEvent() returned .response_ready for this stream.
+    pub fn takeResponse(self: *H3Client, stream_id: u62) H3Error!H3Response {
+        return self.buildResponse(stream_id);
+    }
+
+    /// Check how many requests are currently in flight (submitted but not yet taken).
+    pub fn inFlightCount(self: *const H3Client) usize {
+        var count: usize = 0;
+        for (&self.stream_bufs) |*sb| {
+            if (sb.stream_id) |sid| {
+                // Exclude control/qpack streams (uni streams have bit 1 set)
+                if (sid & 0x02 == 0) count += 1;
+            }
+        }
+        return count;
+    }
+
     pub fn close(self: *H3Client) void {
         self.session.close();
         self.quic.close();
