@@ -118,6 +118,8 @@ pub const H3Server = struct {
     quic: QuicServer,
     stream_bufs: [MAX_STREAMS]StreamBuf,
     control_sent: [QuicServer.MAX_CONNS]bool,
+    shutting_down: bool,
+    goaway_stream_id: u62,
 
     const MAX_STREAMS = 32;
     const POLL_TIMEOUT_MS: u64 = 5000;
@@ -130,6 +132,8 @@ pub const H3Server = struct {
             .quic = server,
             .stream_bufs = undefined,
             .control_sent = [_]bool{false} ** QuicServer.MAX_CONNS,
+            .shutting_down = false,
+            .goaway_stream_id = std.math.maxInt(u62),
         };
         for (&s.stream_bufs) |*sb| {
             sb.* = StreamBuf.init();
@@ -291,11 +295,62 @@ pub const H3Server = struct {
             return H3ServerError.WriteFailed;
     }
 
+    /// Send a GOAWAY frame to a specific connection on its control stream.
+    /// `last_stream_id` is the highest client-initiated stream ID the server will process.
+    pub fn sendGoaway(self: *H3Server, conn_idx: usize, last_stream_id: u62) H3ServerError!void {
+        var frame_buf: [32]u8 = undefined;
+        const frame_len = h3_frame.encodeGoawayFrame(&frame_buf, last_stream_id) orelse
+            return H3ServerError.EncodeFailed;
+
+        // GOAWAY is sent on the server-initiated control stream (stream_id=3)
+        self.quic.sendStreamDataOn(conn_idx, 3, frame_buf[0..frame_len], false) catch
+            return H3ServerError.WriteFailed;
+    }
+
+    /// Initiate graceful shutdown: send GOAWAY to all connected clients,
+    /// reject new streams above the GOAWAY stream ID.
+    /// `last_stream_id` should be the highest client-initiated bidi stream ID
+    /// that the server is willing to process (typically current max + 4).
+    pub fn gracefulShutdown(self: *H3Server, last_stream_id: u62) void {
+        self.shutting_down = true;
+        self.goaway_stream_id = last_stream_id;
+
+        for (0..self.quic.conn_count) |ci| {
+            if (self.quic.conns[ci].active and self.quic.conns[ci].state == .connected) {
+                self.sendGoaway(ci, last_stream_id) catch {};
+            }
+        }
+    }
+
+    /// Close all connections with CONNECTION_CLOSE after drain period.
+    /// Call this after gracefulShutdown once in-flight requests are done.
+    pub fn forceClose(self: *H3Server) void {
+        // H3_NO_ERROR = 0x0100
+        self.quic.closeAllConnections(0x0100, "");
+    }
+
+    pub fn isShuttingDown(self: *const H3Server) bool {
+        return self.shutting_down;
+    }
+
+    pub fn activeConnectionCount(self: *const H3Server) usize {
+        var count: usize = 0;
+        for (0..self.quic.conn_count) |ci| {
+            if (self.quic.conns[ci].active and self.quic.conns[ci].state == .connected) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
     /// Handle received stream data: buffer it and try to parse H3 frames.
     fn handleStreamData(self: *H3Server, stream_id: u62, conn_idx: usize, data: []const u8, fin: bool) H3ServerEvent {
         // Only process client-initiated bidirectional streams (stream_id & 0x03 == 0x00)
         // Skip unidirectional streams (control, QPACK encoder/decoder)
         if (stream_id & 0x03 != 0x00) return .none;
+
+        // Reject new streams above the GOAWAY stream ID during shutdown
+        if (self.shutting_down and stream_id >= self.goaway_stream_id) return .none;
 
         const sb = self.getOrAllocStream(stream_id, conn_idx) orelse return .none;
 
@@ -726,4 +781,53 @@ test "H3Server: response encoding produces valid QPACK" {
     // Verify frame can be decoded
     const decoded = h3_frame.decodeFrameHeader(frame_buf[0..frame_len]) orelse unreachable;
     try std.testing.expectEqual(@as(u64, 0x01), decoded.frame_type);
+}
+
+test "H3Server: gracefulShutdown sets state" {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try H3Server.init(addr, .{});
+    defer server.deinit();
+
+    try std.testing.expect(!server.isShuttingDown());
+    server.gracefulShutdown(4);
+    try std.testing.expect(server.isShuttingDown());
+    try std.testing.expectEqual(@as(u62, 4), server.goaway_stream_id);
+}
+
+test "H3Server: shutdown rejects streams above goaway_stream_id" {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try H3Server.init(addr, .{});
+    defer server.deinit();
+
+    // Before shutdown, stream 8 is accepted (gets buffered)
+    const event1 = server.handleStreamData(8, 0, "data", false);
+    // Returns .none because no complete HEADERS yet, but it was buffered
+    _ = event1;
+
+    // After shutdown with goaway_stream_id=4, stream 8 is rejected
+    server.gracefulShutdown(4);
+    const event2 = server.handleStreamData(8, 0, "more", true);
+    try std.testing.expect(event2 == .none);
+
+    // Stream 0 (below goaway) is still accepted
+    var headers_to_encode = [_]qpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/test" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var qpack_buf: [512]u8 = undefined;
+    const qpack_len = qpack.Encoder.encode(&qpack_buf, &headers_to_encode) orelse unreachable;
+    var frame_buf: [1024]u8 = undefined;
+    const frame_len = h3_frame.encodeHeadersFrame(&frame_buf, qpack_buf[0..qpack_len]) orelse unreachable;
+
+    const event3 = server.handleStreamData(0, 0, frame_buf[0..frame_len], true);
+    try std.testing.expect(event3 == .request);
+}
+
+test "H3Server: activeConnectionCount" {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try H3Server.init(addr, .{});
+    defer server.deinit();
+    try std.testing.expectEqual(@as(usize, 0), server.activeConnectionCount());
 }

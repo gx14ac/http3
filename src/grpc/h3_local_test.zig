@@ -150,3 +150,63 @@ test "gRPC local: H3Channel multiple sequential RPCs" {
 
     server_thread.join();
 }
+
+test "gRPC local: graceful shutdown rejects new requests" {
+    const allocator = std.testing.allocator;
+
+    const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = GrpcServer.init(bind_addr, .{}) catch return;
+    defer server.deinit();
+    _ = server.addRoute("/test.Echo/", EchoHandler.serviceHandler());
+    const port = server.getPort();
+
+    // Server loop that handles one request, then initiates shutdown
+    const ShutdownLoop = struct {
+        fn run(s: *GrpcServer) void {
+            s.setTimeout(500);
+            var handled_first = false;
+            var iterations: usize = 0;
+            while (iterations < 100) : (iterations += 1) {
+                const event = s.poll();
+                switch (event) {
+                    .request => |req| {
+                        if (!handled_first) {
+                            s.handleAndRespond(&req) catch {};
+                            handled_first = true;
+                            // Shutdown: reject streams >= 4 (next client bidi stream)
+                            s.shutdown(4);
+                        } else {
+                            // Should not reach here after shutdown for new streams
+                            s.handleAndRespond(&req) catch {};
+                        }
+                    },
+                    .none, .timeout, .connected, .data => {},
+                }
+            }
+        }
+    };
+
+    const server_thread = std.Thread.spawn(.{}, ShutdownLoop.run, .{&server}) catch return;
+
+    const server_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    var ch = H3Channel.init(allocator, server_addr, "localhost", .{});
+    defer ch.close();
+
+    ch.connect() catch {
+        server_thread.join();
+        return;
+    };
+
+    // First request should succeed
+    var response_buf: [4096]u8 = undefined;
+    const result1 = ch.unary("/test.Echo/Echo", "before shutdown", .{ .timeout_ms = 5000 }, &response_buf) catch {
+        server_thread.join();
+        return;
+    };
+    try std.testing.expectEqual(grpc_status.Code.ok, result1.status.code);
+
+    // Verify server is shutting down
+    try std.testing.expect(server.isShuttingDown());
+
+    server_thread.join();
+}

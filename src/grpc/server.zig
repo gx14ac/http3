@@ -231,6 +231,29 @@ pub const GrpcServer = struct {
         self.h3.setTimeout(ms);
     }
 
+    /// Initiate graceful shutdown (RFC 9114 §5.2 + gRPC GOAWAY semantics).
+    /// Sends GOAWAY to all clients with the given last_stream_id.
+    /// After calling this, new requests on streams >= last_stream_id are silently dropped.
+    /// Existing in-flight requests continue to completion.
+    /// Call `forceClose()` after a drain period to terminate connections.
+    pub fn shutdown(self: *GrpcServer, last_stream_id: u62) void {
+        self.h3.gracefulShutdown(last_stream_id);
+    }
+
+    /// Force-close all connections after the drain period.
+    /// Call this after shutdown() + drain to terminate remaining connections.
+    pub fn forceClose(self: *GrpcServer) void {
+        self.h3.forceClose();
+    }
+
+    pub fn isShuttingDown(self: *const GrpcServer) bool {
+        return self.h3.isShuttingDown();
+    }
+
+    pub fn activeConnectionCount(self: *const GrpcServer) usize {
+        return self.h3.activeConnectionCount();
+    }
+
     /// Create a ServerStream handle for sending streaming responses on a request's stream.
     pub fn openStream(self: *GrpcServer, req: *const GrpcRequest) ServerStream {
         return .{
@@ -631,4 +654,21 @@ test "isDeadlineExceeded: past deadline is exceeded" {
 test "isDeadlineExceeded: future deadline is not exceeded" {
     const future: i128 = std.time.nanoTimestamp() + 10_000_000_000;
     try std.testing.expect(!isDeadlineExceeded(future));
+}
+
+test "GrpcServer: shutdown sets state" {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try GrpcServer.init(addr, .{});
+    defer server.deinit();
+
+    try std.testing.expect(!server.isShuttingDown());
+    server.shutdown(4);
+    try std.testing.expect(server.isShuttingDown());
+}
+
+test "GrpcServer: activeConnectionCount initially zero" {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try GrpcServer.init(addr, .{});
+    defer server.deinit();
+    try std.testing.expectEqual(@as(usize, 0), server.activeConnectionCount());
 }

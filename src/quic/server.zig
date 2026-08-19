@@ -764,6 +764,52 @@ pub const QuicServer = struct {
         self.sendToAddr(pkt_buf[0..pkt_len], client_addr) catch {};
     }
 
+    /// Send a CONNECTION_CLOSE frame (application-level, 0x1d) to a specific connection.
+    /// The connection is marked closed after sending.
+    pub fn closeConnection(self: *QuicServer, ci: usize, error_code: u62, reason: []const u8) void {
+        if (ci >= self.conn_count) return;
+        const app_keys = self.conns[ci].app_keys orelse return;
+        const client_addr = self.conns[ci].client_addr orelse return;
+
+        // Build CONNECTION_CLOSE frame (type 0x1d = application)
+        var frame_buf: [256]u8 = undefined;
+        var fpos: usize = 0;
+        frame_buf[fpos] = 0x1d;
+        fpos += 1;
+        fpos += packet_mod.encodeVarint(frame_buf[fpos..], error_code) orelse return;
+        fpos += packet_mod.encodeVarint(frame_buf[fpos..], reason.len) orelse return;
+        if (fpos + reason.len > frame_buf.len) return;
+        @memcpy(frame_buf[fpos..][0..reason.len], reason);
+        fpos += reason.len;
+
+        var pkt_buf: [512]u8 = undefined;
+        const pn = self.conns[ci].app_send_pn;
+        self.conns[ci].app_send_pn += 1;
+
+        const pkt_len = encodeShortHeaderPacket(
+            &pkt_buf,
+            self.conns[ci].dcid[0..self.conns[ci].dcid_len],
+            pn,
+            frame_buf[0..fpos],
+            app_keys.server_key,
+            app_keys.server_iv,
+            app_keys.server_hp,
+        ) orelse return;
+
+        self.sendToAddr(pkt_buf[0..pkt_len], client_addr) catch {};
+        self.conns[ci].state = .closed;
+        self.conns[ci].active = false;
+    }
+
+    /// Close all active connections with the given error code.
+    pub fn closeAllConnections(self: *QuicServer, error_code: u62, reason: []const u8) void {
+        for (0..self.conn_count) |ci| {
+            if (self.conns[ci].active and self.conns[ci].state == .connected) {
+                self.closeConnection(ci, error_code, reason);
+            }
+        }
+    }
+
     fn sendToAddr(self: *QuicServer, data: []const u8, addr: std.net.Address) !void {
         _ = posix.sendto(self.fd, data, 0, &addr.any, addr.getOsSockLen()) catch
             return error.SocketError;
@@ -1143,4 +1189,12 @@ test "feedCryptoFrames: padding before CRYPTO" {
 
     try std.testing.expect(feedCryptoFrames(&reassembler, buf[0..7]));
     try std.testing.expectEqualSlices(u8, "OK", reassembler.getData());
+}
+
+test "QuicServer: closeAllConnections on empty server" {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try QuicServer.init(addr, .{});
+    defer server.deinit();
+    // Should not crash with zero connections
+    server.closeAllConnections(0x0100, "shutdown");
 }
