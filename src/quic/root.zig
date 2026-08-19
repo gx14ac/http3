@@ -182,6 +182,13 @@ pub const zero_rtt = @import("zero_rtt.zig");
 pub const ZeroRttClientHelloBuilder = zero_rtt.ZeroRttClientHelloBuilder;
 
 pub const server_handshake = @import("server_handshake.zig");
+pub const ParsedClientHello = server_handshake.ParsedClientHello;
+pub const ServerHandshakeState = server_handshake.ServerHandshakeState;
+pub const ServerTicketStore = server_handshake.ServerTicketStore;
+pub const buildNewSessionTicket = server_handshake.buildNewSessionTicket;
+pub const issueNewSessionTicket = server_handshake.issueNewSessionTicket;
+pub const validate0Rtt = server_handshake.validate0Rtt;
+
 pub const server = @import("server.zig");
 pub const QuicServer = server.QuicServer;
 pub const ServerConn = server.ServerConn;

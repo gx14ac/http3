@@ -24,6 +24,14 @@ pub const ParsedClientHello = struct {
     server_name_len: u8,
     alpn: [16]u8,
     alpn_len: u8,
+    // PSK extension (0x0029) for 0-RTT resumption
+    has_psk: bool,
+    psk_identity: [256]u8,
+    psk_identity_len: u16,
+    psk_binder: [32]u8,
+    obfuscated_ticket_age: u32,
+    // early_data extension (0x002a) present
+    has_early_data: bool,
 };
 
 /// Parse a TLS 1.3 ClientHello to extract key_share and SNI.
@@ -42,6 +50,12 @@ pub fn parseClientHello(ch: []const u8) ServerHandshakeError!ParsedClientHello {
         .server_name_len = 0,
         .alpn = undefined,
         .alpn_len = 0,
+        .has_psk = false,
+        .psk_identity = undefined,
+        .psk_identity_len = 0,
+        .psk_binder = undefined,
+        .obfuscated_ticket_age = 0,
+        .has_early_data = false,
     };
 
     // Skip type(1) + length(3) + version(2) = offset 6
@@ -123,6 +137,39 @@ pub fn parseClientHello(ch: []const u8) ServerHandshakeError!ParsedClientHello {
                         result.alpn_len = proto_len;
                     }
                 }
+            },
+            0x0029 => {
+                // pre_shared_key (RFC 8446 §4.2.11)
+                // identities_len(2) + [identity_len(2) + identity + obfuscated_ticket_age(4)] + binders_len(2) + [binder_len(1) + binder]
+                if (ext_data_len >= 6) {
+                    const identities_len = std.mem.readInt(u16, ch[pos..][0..2], .big);
+                    if (identities_len >= 6 and 2 + identities_len <= ext_data_len) {
+                        const id_len = std.mem.readInt(u16, ch[pos + 2 ..][0..2], .big);
+                        if (id_len <= 256 and 2 + 2 + id_len + 4 <= 2 + identities_len) {
+                            const id_start = pos + 4;
+                            @memcpy(result.psk_identity[0..id_len], ch[id_start..][0..id_len]);
+                            result.psk_identity_len = id_len;
+                            result.obfuscated_ticket_age = std.mem.readInt(u32, ch[id_start + id_len ..][0..4], .big);
+                            // Parse first binder
+                            const binders_offset = pos + 2 + identities_len;
+                            if (binders_offset + 2 <= pos + ext_data_len) {
+                                const binders_len = std.mem.readInt(u16, ch[binders_offset..][0..2], .big);
+                                _ = binders_len;
+                                if (binders_offset + 3 <= pos + ext_data_len) {
+                                    const binder_len = ch[binders_offset + 2];
+                                    if (binder_len == 32 and binders_offset + 3 + 32 <= pos + ext_data_len) {
+                                        @memcpy(&result.psk_binder, ch[binders_offset + 3 ..][0..32]);
+                                        result.has_psk = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            0x002a => {
+                // early_data indication (empty in ClientHello)
+                result.has_early_data = true;
             },
             else => {},
         }
@@ -622,6 +669,203 @@ pub const ServerHandshakeState = struct {
     }
 };
 
+// ─── NewSessionTicket (RFC 8446 §4.6.1) ───
+
+/// Build a NewSessionTicket TLS message for 0-RTT resumption.
+/// Returns the message bytes (handshake type + length + body).
+/// The ticket value is a random opaque blob; the server must remember
+/// the mapping from ticket → PSK externally (via TicketStore or equivalent).
+pub fn buildNewSessionTicket(
+    buf: []u8,
+    ticket_lifetime: u32,
+    ticket_age_add: u32,
+    ticket_nonce: []const u8,
+    ticket_value: []const u8,
+    max_early_data_size: u32,
+) ?usize {
+    // Handshake type (0x04 = NewSessionTicket) + 3-byte length
+    if (buf.len < 4) return null;
+    buf[0] = 0x04;
+    var pos: usize = 4; // length filled later
+
+    // ticket_lifetime (4)
+    if (buf.len < pos + 4) return null;
+    std.mem.writeInt(u32, buf[pos..][0..4], ticket_lifetime, .big);
+    pos += 4;
+
+    // ticket_age_add (4)
+    if (buf.len < pos + 4) return null;
+    std.mem.writeInt(u32, buf[pos..][0..4], ticket_age_add, .big);
+    pos += 4;
+
+    // ticket_nonce_len (1) + ticket_nonce
+    if (buf.len < pos + 1 + ticket_nonce.len) return null;
+    buf[pos] = @intCast(ticket_nonce.len);
+    pos += 1;
+    @memcpy(buf[pos..][0..ticket_nonce.len], ticket_nonce);
+    pos += ticket_nonce.len;
+
+    // ticket_len (2) + ticket
+    if (buf.len < pos + 2 + ticket_value.len) return null;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(ticket_value.len), .big);
+    pos += 2;
+    @memcpy(buf[pos..][0..ticket_value.len], ticket_value);
+    pos += ticket_value.len;
+
+    // extensions: early_data (0x002a) with max_early_data_size
+    const ext_data: usize = if (max_early_data_size > 0) 8 else 0;
+    if (buf.len < pos + 2 + ext_data) return null;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(ext_data), .big);
+    pos += 2;
+    if (max_early_data_size > 0) {
+        std.mem.writeInt(u16, buf[pos..][0..2], 0x002a, .big);
+        pos += 2;
+        std.mem.writeInt(u16, buf[pos..][0..2], 4, .big);
+        pos += 2;
+        std.mem.writeInt(u32, buf[pos..][0..4], max_early_data_size, .big);
+        pos += 4;
+    }
+
+    // Fill handshake length (3 bytes big-endian)
+    const body_len = pos - 4;
+    buf[1] = @intCast((body_len >> 16) & 0xFF);
+    buf[2] = @intCast((body_len >> 8) & 0xFF);
+    buf[3] = @intCast(body_len & 0xFF);
+
+    return pos;
+}
+
+/// Server-side ticket store for 0-RTT validation.
+/// Maps opaque ticket values to the PSK needed to derive early keys.
+pub const ServerTicketStore = struct {
+    entries: [MAX_ENTRIES]?TicketEntry,
+    count: usize,
+
+    const MAX_ENTRIES = 16;
+
+    pub const TicketEntry = struct {
+        ticket: [256]u8,
+        ticket_len: u16,
+        psk: [32]u8,
+        issued_at_ms: i64,
+        lifetime_s: u32,
+    };
+
+    pub fn init() ServerTicketStore {
+        return .{
+            .entries = [_]?TicketEntry{null} ** MAX_ENTRIES,
+            .count = 0,
+        };
+    }
+
+    /// Store a ticket → PSK mapping.
+    pub fn store(self: *ServerTicketStore, ticket_value: []const u8, psk: [32]u8, issued_at_ms: i64, lifetime_s: u32) void {
+        var target: usize = 0;
+        for (&self.entries, 0..) |*e, i| {
+            if (e.* == null) {
+                target = i;
+                break;
+            }
+            target = i; // overwrite last slot if full
+        }
+        var entry: TicketEntry = undefined;
+        entry.ticket_len = @intCast(@min(ticket_value.len, 256));
+        @memcpy(entry.ticket[0..entry.ticket_len], ticket_value[0..entry.ticket_len]);
+        entry.psk = psk;
+        entry.issued_at_ms = issued_at_ms;
+        entry.lifetime_s = lifetime_s;
+        const was_empty = self.entries[target] == null;
+        self.entries[target] = entry;
+        if (was_empty and self.count < MAX_ENTRIES) self.count += 1;
+    }
+
+    /// Look up a PSK by ticket value. Returns null if not found or expired.
+    pub fn lookup(self: *const ServerTicketStore, ticket_value: []const u8, now_ms: i64) ?[32]u8 {
+        for (&self.entries) |*slot| {
+            if (slot.*) |entry| {
+                if (entry.ticket_len != ticket_value.len) continue;
+                if (!std.mem.eql(u8, entry.ticket[0..entry.ticket_len], ticket_value)) continue;
+                const age_ms = now_ms - entry.issued_at_ms;
+                if (age_ms < 0 or age_ms > @as(i64, entry.lifetime_s) * 1000) continue;
+                return entry.psk;
+            }
+        }
+        return null;
+    }
+};
+
+/// Issue a NewSessionTicket after handshake completes.
+/// Derives the PSK from the master_secret + transcript, builds the ticket message,
+/// and stores the ticket → PSK mapping in the ticket store.
+/// Returns the number of bytes written to `out_buf`, or null on failure.
+pub fn issueNewSessionTicket(
+    state: *const ServerHandshakeState,
+    transcript_hash_full: [32]u8,
+    ticket_store: *ServerTicketStore,
+    out_buf: []u8,
+    issued_at_ms: i64,
+) ?usize {
+    const resumption = @import("resumption.zig");
+
+    const rms = resumption.deriveResumptionMasterSecret(
+        state.app_keys.master_secret,
+        transcript_hash_full,
+    );
+
+    // Generate ticket nonce and value
+    var ticket_nonce: [8]u8 = undefined;
+    crypto.random.bytes(&ticket_nonce);
+    var ticket_value: [32]u8 = undefined;
+    crypto.random.bytes(&ticket_value);
+
+    // Compute PSK = HKDF-Expand-Label(rms, "resumption", nonce)
+    const psk = resumption.computePsk(rms, &ticket_nonce);
+
+    const lifetime: u32 = 7200; // 2 hours
+    var ticket_age_add: [4]u8 = undefined;
+    crypto.random.bytes(&ticket_age_add);
+    const age_add = std.mem.readInt(u32, &ticket_age_add, .big);
+
+    // Store in server's ticket store
+    ticket_store.store(&ticket_value, psk, issued_at_ms, lifetime);
+
+    // Build the TLS NewSessionTicket message
+    return buildNewSessionTicket(
+        out_buf,
+        lifetime,
+        age_add,
+        &ticket_nonce,
+        &ticket_value,
+        0x4000, // max_early_data_size = 16KB
+    );
+}
+
+/// Validate a 0-RTT attempt: look up the PSK from the ticket store and derive early keys.
+/// Returns the early keys for decrypting 0-RTT data, or null if ticket is invalid/expired.
+pub fn validate0Rtt(
+    parsed_ch: *const ParsedClientHello,
+    ch_raw: []const u8,
+    ticket_store: *const ServerTicketStore,
+    now_ms: i64,
+) ?@import("resumption.zig").EarlyKeys {
+    const resumption = @import("resumption.zig");
+
+    if (!parsed_ch.has_psk or !parsed_ch.has_early_data) return null;
+
+    // Look up PSK by ticket (identity)
+    const psk = ticket_store.lookup(
+        parsed_ch.psk_identity[0..parsed_ch.psk_identity_len],
+        now_ms,
+    ) orelse return null;
+
+    // Derive early keys from PSK and ClientHello hash
+    const early_secret = resumption.deriveEarlySecret(psk);
+    var ch_hash: [32]u8 = undefined;
+    Sha256.hash(ch_raw, &ch_hash, .{});
+
+    return resumption.deriveEarlyKeys(early_secret, ch_hash);
+}
+
 // ─── Tests ───
 
 test "parseClientHello: extract key_share and SNI" {
@@ -732,4 +976,55 @@ test "ServerHandshakeState: full handshake produces keys" {
         }
     }
     try std.testing.expect(!all_zero);
+}
+
+test "buildNewSessionTicket: valid encoding" {
+    var buf: [512]u8 = undefined;
+    const nonce = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const ticket = [_]u8{0xAA} ** 32;
+    const len = buildNewSessionTicket(&buf, 7200, 0x12345678, &nonce, &ticket, 0x4000) orelse unreachable;
+
+    // Type = NewSessionTicket (0x04)
+    try std.testing.expectEqual(@as(u8, 0x04), buf[0]);
+    // ticket_lifetime
+    try std.testing.expectEqual(@as(u32, 7200), std.mem.readInt(u32, buf[4..8], .big));
+    // ticket_age_add
+    try std.testing.expectEqual(@as(u32, 0x12345678), std.mem.readInt(u32, buf[8..12], .big));
+    // nonce length
+    try std.testing.expectEqual(@as(u8, 4), buf[12]);
+    // ticket length
+    try std.testing.expectEqual(@as(u16, 32), std.mem.readInt(u16, buf[17..19], .big));
+    try std.testing.expect(len > 50);
+}
+
+test "ServerTicketStore: store and lookup" {
+    var store = ServerTicketStore.init();
+    const ticket = [_]u8{0xBB} ** 32;
+    const psk = [_]u8{0xCC} ** 32;
+    store.store(&ticket, psk, 1000, 3600);
+
+    // Lookup within lifetime
+    const found = store.lookup(&ticket, 2000);
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualSlices(u8, &psk, &found.?);
+
+    // Lookup after expiry
+    const expired = store.lookup(&ticket, 1000 + 3600 * 1000 + 1);
+    try std.testing.expect(expired == null);
+
+    // Lookup with wrong ticket
+    const wrong = [_]u8{0xDD} ** 32;
+    try std.testing.expect(store.lookup(&wrong, 2000) == null);
+}
+
+test "parseClientHello: PSK fields default to false" {
+    const tls_mod = @import("tls.zig");
+    const builder = tls_mod.ClientHelloBuilder.init("example.com");
+    var ch_buf: [2048]u8 = undefined;
+    const ch_len = builder.build(&ch_buf) orelse unreachable;
+
+    const parsed = try parseClientHello(ch_buf[0..ch_len]);
+    try std.testing.expect(!parsed.has_psk);
+    try std.testing.expect(!parsed.has_early_data);
+    try std.testing.expectEqual(@as(u16, 0), parsed.psk_identity_len);
 }

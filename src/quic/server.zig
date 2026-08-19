@@ -39,6 +39,7 @@ pub const ServerConn = struct {
     app_recv_pn: u64,
     client_addr: ?std.net.Address,
     transcript_after_server_finished: ?[32]u8,
+    master_secret: ?[32]u8,
     initial_crypto: handshake_flight.CryptoReassembler,
     handshake_crypto: handshake_flight.CryptoReassembler,
     flow: flow_control_mod.FlowController,
@@ -70,6 +71,7 @@ pub const ServerConn = struct {
             .app_recv_pn = 0,
             .client_addr = null,
             .transcript_after_server_finished = null,
+            .master_secret = null,
             .initial_crypto = handshake_flight.CryptoReassembler.init(),
             .handshake_crypto = handshake_flight.CryptoReassembler.init(),
             .flow = flow_control_mod.FlowController.init(.{}),
@@ -100,11 +102,14 @@ pub const QuicServer = struct {
     cert_der_len: usize,
     recv_stream_buf: [4096]u8,
     recv_stream_len: usize,
+    ticket_store: server_hs.ServerTicketStore,
+    zero_rtt_enabled: bool,
 
     pub const MAX_CONNS = 16;
 
     pub const Config = struct {
         cert_der: ?[]const u8 = null,
+        enable_zero_rtt: bool = false,
     };
 
     pub fn init(bind_addr: std.net.Address, config: Config) ServerError!QuicServer {
@@ -145,6 +150,8 @@ pub const QuicServer = struct {
             .cert_der_len = cert_len,
             .recv_stream_buf = undefined,
             .recv_stream_len = 0,
+            .ticket_store = server_hs.ServerTicketStore.init(),
+            .zero_rtt_enabled = config.enable_zero_rtt,
         };
     }
 
@@ -194,6 +201,11 @@ pub const QuicServer = struct {
         const conn_idx = self.routePacket(data) orelse {
             // New connection — find a free slot or use slot 0 for Initial
             if (data.len >= 1 and data[0] & 0x80 != 0) {
+                const ptype_new: u2 = @intCast((data[0] >> 4) & 0x03);
+                if (ptype_new == @intFromEnum(packet_mod.PacketType.zero_rtt)) {
+                    // 0-RTT before connection is established — buffer for later
+                    return .none;
+                }
                 return self.handleInitial(data, &src_addr);
             }
             return ServerError.InvalidPacket;
@@ -383,6 +395,7 @@ pub const QuicServer = struct {
         self.conns[ci].client_traffic_secret = hs_state.app_keys.client_secret;
         self.conns[ci].server_traffic_secret = hs_state.app_keys.server_secret;
         self.conns[ci].transcript_after_server_finished = hs_state.transcript_after_server_finished;
+        self.conns[ci].master_secret = hs_state.app_keys.master_secret;
 
         // Send Initial packet with ServerHello + Handshake packet with EE+Cert+CV+Finished
         var send_buf: [4096]u8 = undefined;
@@ -545,6 +558,11 @@ pub const QuicServer = struct {
 
         // RFC 9000 §7.3: Server MUST send HANDSHAKE_DONE in a 1-RTT packet
         self.sendHandshakeDone(ci);
+
+        // Issue NewSessionTicket for 0-RTT on future connections
+        if (self.zero_rtt_enabled) {
+            self.sendNewSessionTicket(ci);
+        }
 
         return .{ .connected = ci };
     }
@@ -756,6 +774,71 @@ pub const QuicServer = struct {
             self.conns[ci].dcid[0..self.conns[ci].dcid_len],
             pn,
             &frame,
+            app_keys.server_key,
+            app_keys.server_iv,
+            app_keys.server_hp,
+        ) orelse return;
+
+        self.sendToAddr(pkt_buf[0..pkt_len], client_addr) catch {};
+    }
+
+    /// Send a NewSessionTicket to the client (1-RTT CRYPTO frame).
+    /// Enables 0-RTT on subsequent connections.
+    fn sendNewSessionTicket(self: *QuicServer, ci: usize) void {
+        const app_keys = self.conns[ci].app_keys orelse return;
+        const client_addr = self.conns[ci].client_addr orelse return;
+        const master_secret = self.conns[ci].master_secret orelse return;
+        const transcript_sf = self.conns[ci].transcript_after_server_finished orelse return;
+
+        // Build the NewSessionTicket TLS message
+        const resumption = @import("resumption.zig");
+        const rms = resumption.deriveResumptionMasterSecret(master_secret, transcript_sf);
+
+        var ticket_nonce: [8]u8 = undefined;
+        crypto.random.bytes(&ticket_nonce);
+        var ticket_value: [32]u8 = undefined;
+        crypto.random.bytes(&ticket_value);
+
+        const psk = resumption.computePsk(rms, &ticket_nonce);
+
+        const lifetime: u32 = 7200;
+        var age_add_bytes: [4]u8 = undefined;
+        crypto.random.bytes(&age_add_bytes);
+        const age_add = std.mem.readInt(u32, &age_add_bytes, .big);
+
+        // Store in ticket store
+        self.ticket_store.store(&ticket_value, psk, std.time.milliTimestamp(), lifetime);
+
+        // Build the TLS message
+        var nst_buf: [256]u8 = undefined;
+        const nst_len = server_hs.buildNewSessionTicket(
+            &nst_buf,
+            lifetime,
+            age_add,
+            &ticket_nonce,
+            &ticket_value,
+            0x4000,
+        ) orelse return;
+
+        // Wrap in a CRYPTO frame and send as 1-RTT
+        var frame_buf: [512]u8 = undefined;
+        var fpos: usize = 0;
+        frame_buf[fpos] = 0x06; // CRYPTO frame type
+        fpos += 1;
+        fpos += packet_mod.encodeVarint(frame_buf[fpos..], 0) orelse return;
+        fpos += packet_mod.encodeVarint(frame_buf[fpos..], nst_len) orelse return;
+        @memcpy(frame_buf[fpos..][0..nst_len], nst_buf[0..nst_len]);
+        fpos += nst_len;
+
+        var pkt_buf: [768]u8 = undefined;
+        const pn = self.conns[ci].app_send_pn;
+        self.conns[ci].app_send_pn += 1;
+
+        const pkt_len = encodeShortHeaderPacket(
+            &pkt_buf,
+            self.conns[ci].dcid[0..self.conns[ci].dcid_len],
+            pn,
+            frame_buf[0..fpos],
             app_keys.server_key,
             app_keys.server_iv,
             app_keys.server_hp,
