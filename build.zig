@@ -112,6 +112,17 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run fuzz tests");
     fuzz_step.dependOn(&run_fuzz.step);
 
+    // H2 E2E tests (TLS + ALPN h2 → real server)
+    const h2_e2e_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/h2_e2e_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const h2_e2e_tests = b.addTest(.{
+        .root_module = h2_e2e_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(h2_e2e_tests).step);
+
     // QUIC tests
     const quic_test_mod = b.createModule(.{
         .root_source_file = b.path("src/quic/root.zig"),
