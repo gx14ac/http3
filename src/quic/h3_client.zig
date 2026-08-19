@@ -78,6 +78,7 @@ pub const H3Client = struct {
         // 1024 bits = 64KB coverage at 64-byte granularity
         recv_bitmap: [128]u8,
         fin_received: bool,
+        response_taken: bool,
 
         fn init() StreamBuf {
             return .{
@@ -87,6 +88,7 @@ pub const H3Client = struct {
                 .contiguous_len = 0,
                 .recv_bitmap = [_]u8{0} ** 128,
                 .fin_received = false,
+                .response_taken = false,
             };
         }
 
@@ -96,6 +98,7 @@ pub const H3Client = struct {
             self.contiguous_len = 0;
             self.recv_bitmap = [_]u8{0} ** 128;
             self.fin_received = false;
+            self.response_taken = false;
         }
 
         const GRANULARITY = 64;
@@ -427,6 +430,7 @@ pub const H3Client = struct {
                 sb.contiguous_len = 0;
                 sb.recv_bitmap = [_]u8{0} ** 128;
                 sb.fin_received = false;
+                sb.response_taken = false;
                 return i;
             }
         }
@@ -629,6 +633,15 @@ pub const H3Client = struct {
     /// Returns .response_ready with the stream_id if any request's response is complete.
     /// Call repeatedly in a loop to process all in-flight requests.
     pub fn pollEvent(self: *H3Client) PollEvent {
+        // Check already-complete streams before polling (handles coalesced packets)
+        for (&self.stream_bufs) |*sb| {
+            if (sb.stream_id) |sid| {
+                if (!sb.response_taken and sid % 4 == 0 and self.isResponseComplete(sid)) {
+                    return .{ .response_ready = sid };
+                }
+            }
+        }
+
         const poll_result = self.quic.poll();
         switch (poll_result) {
             .received => {
@@ -636,10 +649,9 @@ pub const H3Client = struct {
                 if (payload.len > 0) {
                     self.feedPayload(payload);
                 }
-                // Check all active streams for completion
                 for (&self.stream_bufs) |*sb| {
                     if (sb.stream_id) |sid| {
-                        if (self.isResponseComplete(sid)) {
+                        if (!sb.response_taken and sid % 4 == 0 and self.isResponseComplete(sid)) {
                             return .{ .response_ready = sid };
                         }
                     }
@@ -653,7 +665,14 @@ pub const H3Client = struct {
 
     /// Take a completed response for the given stream ID.
     /// Only valid after pollEvent() returned .response_ready for this stream.
+    /// Calling twice for the same stream_id returns InvalidResponse.
     pub fn takeResponse(self: *H3Client, stream_id: u62) H3Error!H3Response {
+        for (&self.stream_bufs) |*sb| {
+            if (sb.stream_id != null and sb.stream_id.? == stream_id) {
+                sb.response_taken = true;
+                break;
+            }
+        }
         return self.buildResponse(stream_id);
     }
 
@@ -662,8 +681,8 @@ pub const H3Client = struct {
         var count: usize = 0;
         for (&self.stream_bufs) |*sb| {
             if (sb.stream_id) |sid| {
-                // Exclude control/qpack streams (uni streams have bit 1 set)
-                if (sid & 0x02 == 0) count += 1;
+                // client-initiated bidi streams: sid % 4 == 0 (RFC 9000 §2.1)
+                if (sid % 4 == 0 and !sb.response_taken) count += 1;
             }
         }
         return count;
