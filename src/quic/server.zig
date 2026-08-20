@@ -9,6 +9,7 @@ const handshake_complete_mod = @import("handshake_complete.zig");
 const tls_messages = @import("tls_messages.zig");
 const server_hs = @import("server_handshake.zig");
 const flow_control_mod = @import("flow_control.zig");
+const resumption = @import("resumption.zig");
 
 pub const ServerError = error{
     BindFailed,
@@ -40,6 +41,8 @@ pub const ServerConn = struct {
     client_addr: ?std.net.Address,
     transcript_after_server_finished: ?[32]u8,
     master_secret: ?[32]u8,
+    early_keys: ?resumption.EarlyKeys,
+    zero_rtt_recv_pn: u64,
     initial_crypto: handshake_flight.CryptoReassembler,
     handshake_crypto: handshake_flight.CryptoReassembler,
     flow: flow_control_mod.FlowController,
@@ -72,6 +75,8 @@ pub const ServerConn = struct {
             .client_addr = null,
             .transcript_after_server_finished = null,
             .master_secret = null,
+            .early_keys = null,
+            .zero_rtt_recv_pn = 0,
             .initial_crypto = handshake_flight.CryptoReassembler.init(),
             .handshake_crypto = handshake_flight.CryptoReassembler.init(),
             .flow = flow_control_mod.FlowController.init(.{}),
@@ -104,6 +109,10 @@ pub const QuicServer = struct {
     recv_stream_len: usize,
     ticket_store: server_hs.ServerTicketStore,
     zero_rtt_enabled: bool,
+    zero_rtt_buf: [4096]u8,
+    zero_rtt_buf_len: usize,
+    zero_rtt_buf_dcid: [20]u8,
+    zero_rtt_buf_dcid_len: u8,
 
     pub const MAX_CONNS = 16;
 
@@ -152,6 +161,10 @@ pub const QuicServer = struct {
             .recv_stream_len = 0,
             .ticket_store = server_hs.ServerTicketStore.init(),
             .zero_rtt_enabled = config.enable_zero_rtt,
+            .zero_rtt_buf = undefined,
+            .zero_rtt_buf_len = 0,
+            .zero_rtt_buf_dcid = undefined,
+            .zero_rtt_buf_dcid_len = 0,
         };
     }
 
@@ -203,7 +216,17 @@ pub const QuicServer = struct {
             if (data.len >= 1 and data[0] & 0x80 != 0) {
                 const ptype_new: u2 = @intCast((data[0] >> 4) & 0x03);
                 if (ptype_new == @intFromEnum(packet_mod.PacketType.zero_rtt)) {
-                    // TODO: buffer 0-RTT packets and decrypt after PSK validation
+                    // Buffer for processing after Initial establishes early keys
+                    // TODO: support multiple buffered 0-RTT packets (currently only one)
+                    if (data.len <= self.zero_rtt_buf.len and data.len >= 7) {
+                        const buf_dcid_len: u8 = @intCast(@min(data[5], 20));
+                        if (data.len >= 6 + @as(usize, buf_dcid_len)) {
+                            @memcpy(self.zero_rtt_buf_dcid[0..buf_dcid_len], data[6..][0..buf_dcid_len]);
+                            self.zero_rtt_buf_dcid_len = buf_dcid_len;
+                            @memcpy(self.zero_rtt_buf[0..data.len], data);
+                            self.zero_rtt_buf_len = data.len;
+                        }
+                    }
                     return .none;
                 }
                 return self.handleInitial(data, &src_addr);
@@ -213,7 +236,16 @@ pub const QuicServer = struct {
 
         return switch (self.conns[conn_idx].state) {
             .awaiting_initial => self.handleInitial(data, &src_addr),
-            .handshake_sent => self.handleHandshakeResponse(data),
+            .handshake_sent => blk: {
+                // Check if this is a 0-RTT packet for a connection in handshake
+                if (data.len >= 1 and data[0] & 0x80 != 0) {
+                    const ptype_routed: u2 = @intCast((data[0] >> 4) & 0x03);
+                    if (ptype_routed == @intFromEnum(packet_mod.PacketType.zero_rtt)) {
+                        break :blk self.handle0RttPacket(data, conn_idx);
+                    }
+                }
+                break :blk self.handleHandshakeResponse(data);
+            },
             .connected => self.handleAppDataForConn(data, conn_idx),
             .closed => .closed,
         };
@@ -397,6 +429,13 @@ pub const QuicServer = struct {
         self.conns[ci].transcript_after_server_finished = hs_state.transcript_after_server_finished;
         self.conns[ci].master_secret = hs_state.app_keys.master_secret;
 
+        // Validate 0-RTT: derive early keys if client offered PSK + early_data
+        if (self.zero_rtt_enabled) {
+            if (server_hs.validate0Rtt(&parsed_ch, crypto_data, &self.ticket_store, std.time.milliTimestamp())) |early_keys| {
+                self.conns[ci].early_keys = early_keys;
+            }
+        }
+
         // Send Initial packet with ServerHello + Handshake packet with EE+Cert+CV+Finished
         var send_buf: [4096]u8 = undefined;
         const send_len = self.buildServerResponseForConn(
@@ -411,6 +450,23 @@ pub const QuicServer = struct {
         self.sendToAddr(send_buf[0..send_len], dst) catch return ServerError.SocketError;
 
         self.conns[ci].state = .handshake_sent;
+
+        // Process buffered 0-RTT packet if we have early keys and DCID matches
+        // 0-RTT uses the same DCID as Initial (client_dcid), not server's SCID
+        if (self.conns[ci].early_keys != null and self.zero_rtt_buf_len > 0) {
+            const cdcid_len = self.conns[ci].client_dcid_len;
+            if (self.zero_rtt_buf_dcid_len == cdcid_len and
+                std.mem.eql(u8, self.zero_rtt_buf_dcid[0..self.zero_rtt_buf_dcid_len], self.conns[ci].client_dcid[0..cdcid_len]))
+            {
+                var buf_copy: [4096]u8 = undefined;
+                const buf_len = self.zero_rtt_buf_len;
+                @memcpy(buf_copy[0..buf_len], self.zero_rtt_buf[0..buf_len]);
+                self.zero_rtt_buf_len = 0;
+                const result = self.handle0RttPacket(buf_copy[0..buf_len], ci);
+                if (result != .none) return result;
+            }
+        }
+
         return .handshake_started;
     }
 
@@ -640,6 +696,102 @@ pub const QuicServer = struct {
         self.conns[ci].flow.onRecv(result_stream_id, total_len);
 
         // Send MAX_DATA / MAX_STREAM_DATA if thresholds exceeded
+        self.sendFlowControlUpdates(ci);
+
+        self.recv_stream_len = total_len;
+        return .{ .data_received = .{
+            .stream_id = result_stream_id,
+            .conn_idx = ci,
+            .offset = result_offset,
+            .data = self.recv_stream_buf[0..total_len],
+            .fin = result_fin,
+        } };
+    }
+
+    /// Handle a 0-RTT packet: decrypt with early keys and process STREAM frames.
+    fn handle0RttPacket(self: *QuicServer, data: []u8, ci: usize) ServerEvent {
+        const early_keys = self.conns[ci].early_keys orelse return .none;
+
+        // Parse long header: form(1) + version(4) + dcid_len(1) + dcid + scid_len(1) + scid + length + pn
+        if (data.len < 7) return .none;
+        if (data[0] & 0x80 == 0) return .none;
+
+        const dcid_len: usize = data[5];
+        if (data.len < 6 + dcid_len + 1) return .none;
+        const scid_len: usize = data[6 + dcid_len];
+        var hpos: usize = 7 + dcid_len + scid_len;
+
+        // Length field (varint)
+        const length_varint = packet_mod.decodeVarint(data[hpos..]) orelse return .none;
+        hpos += length_varint.consumed;
+        const length: usize = @intCast(length_varint.value);
+        if (data.len < hpos + length) return .none;
+
+        const pn_offset = hpos;
+
+        // Remove header protection
+        if (data.len < pn_offset + 4 + 16) return .none;
+        quic_crypto.removeHeaderProtection(data, pn_offset, early_keys.hp);
+
+        const pn_length: usize = (data[0] & 0x03) + 1;
+        var pn: u64 = 0;
+        for (0..pn_length) |i| {
+            pn = (pn << 8) | data[pn_offset + i];
+        }
+
+        const aad = data[0 .. pn_offset + pn_length];
+        const ct_start = pn_offset + pn_length;
+        if (length < pn_length + 16) return .none;
+        const ct_len = length - pn_length - 16;
+        if (data.len < ct_start + ct_len + 16) return .none;
+        const ciphertext = data[ct_start..][0..ct_len];
+        const tag: *const [16]u8 = data[ct_start + ct_len ..][0..16];
+
+        var plaintext: [4096]u8 = undefined;
+        if (ct_len > plaintext.len) return .none;
+        const ok = quic_crypto.decryptPayload(
+            plaintext[0..ct_len],
+            ciphertext,
+            tag.*,
+            early_keys.key,
+            early_keys.iv,
+            pn,
+            aad,
+        );
+        if (!ok) return .none;
+
+        // Reject duplicate packet numbers
+        if (pn < self.conns[ci].zero_rtt_recv_pn) return .none;
+        self.conns[ci].zero_rtt_recv_pn = pn + 1;
+
+        // Process STREAM frames from 0-RTT data (same as 1-RTT app data)
+        self.processFlowControlFrames(ci, plaintext[0..ct_len]);
+
+        var total_len: usize = 0;
+        var result_stream_id: u62 = 0;
+        var result_offset: u64 = 0;
+        var result_fin: bool = false;
+        var found_any: bool = false;
+
+        var scan_pos: usize = 0;
+        while (scan_pos < ct_len) {
+            const sf = extractStreamFrameAt(plaintext[0..ct_len], scan_pos) orelse break;
+            if (!found_any) {
+                result_stream_id = sf.stream_id;
+                result_offset = sf.offset;
+                found_any = true;
+            }
+            if (sf.fin) result_fin = true;
+            const copy_len = @min(sf.data_len, self.recv_stream_buf.len - total_len);
+            @memcpy(self.recv_stream_buf[total_len..][0..copy_len], plaintext[sf.data_start..][0..copy_len]);
+            total_len += copy_len;
+            scan_pos = sf.frame_end;
+        }
+
+        if (!found_any) return .none;
+
+        _ = self.conns[ci].flow.openStream(result_stream_id);
+        self.conns[ci].flow.onRecv(result_stream_id, total_len);
         self.sendFlowControlUpdates(ci);
 
         self.recv_stream_len = total_len;
@@ -1260,4 +1412,79 @@ test "QuicServer: closeAllConnections on empty server" {
     defer server.deinit();
     // Should not crash with zero connections
     server.closeAllConnections(0x0100, "shutdown");
+}
+
+test "handle0RttPacket: decrypts and extracts STREAM data" {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try QuicServer.init(addr, .{ .enable_zero_rtt = true });
+    defer server.deinit();
+
+    // Manually set up a connection in handshake_sent state with early keys
+    const ci = server.allocConn() orelse unreachable;
+    server.conns[ci].state = .handshake_sent;
+    const scid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    @memcpy(server.conns[ci].scid[0..8], &scid);
+    server.conns[ci].scid_len = 8;
+
+    // Use deterministic early keys for testing
+    const early_key = [_]u8{0xAA} ** 16;
+    const early_iv = [_]u8{0xBB} ** 12;
+    const early_hp = [_]u8{0xCC} ** 16;
+    server.conns[ci].early_keys = .{
+        .key = early_key,
+        .iv = early_iv,
+        .hp = early_hp,
+    };
+
+    // Build a 0-RTT packet with a STREAM frame payload
+    // STREAM frame: type=0x0a (STREAM + LEN), stream_id=0, len=5, data="hello"
+    var stream_frame: [8]u8 = undefined;
+    stream_frame[0] = 0x0a; // STREAM | LEN
+    stream_frame[1] = 0x00; // stream_id = 0
+    stream_frame[2] = 0x05; // length = 5
+    @memcpy(stream_frame[3..8], "hello");
+    const payload = stream_frame[0..8];
+
+    // Encode as 0-RTT long header packet
+    const dcid = scid; // server's SCID is the DCID in the 0-RTT packet
+    const client_scid = [_]u8{ 0x0A, 0x0B };
+    const pn: u64 = 0;
+    var pkt_buf: [256]u8 = undefined;
+    const pkt_len = resumption.encode0RttPacket(
+        &pkt_buf,
+        &dcid,
+        &client_scid,
+        pn,
+        payload,
+        early_key,
+        early_iv,
+        early_hp,
+    ) orelse unreachable;
+
+    // Feed the packet to handle0RttPacket
+    const event = server.handle0RttPacket(pkt_buf[0..pkt_len], ci);
+
+    // Verify we got data_received with "hello"
+    switch (event) {
+        .data_received => |d| {
+            try std.testing.expectEqual(@as(u62, 0), d.stream_id);
+            try std.testing.expectEqualSlices(u8, "hello", d.data);
+            try std.testing.expect(!d.fin);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "handle0RttPacket: returns none without early keys" {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try QuicServer.init(addr, .{ .enable_zero_rtt = true });
+    defer server.deinit();
+
+    const ci = server.allocConn() orelse unreachable;
+    server.conns[ci].state = .handshake_sent;
+    // No early_keys set
+
+    var fake_pkt = [_]u8{0xD0} ++ [_]u8{0} ** 100;
+    const event = server.handle0RttPacket(&fake_pkt, ci);
+    try std.testing.expect(event == .none);
 }

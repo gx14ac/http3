@@ -749,6 +749,7 @@ pub const ServerTicketStore = struct {
         psk: [32]u8,
         issued_at_ms: i64,
         lifetime_s: u32,
+        used_for_0rtt: bool,
     };
 
     pub fn init() ServerTicketStore {
@@ -791,6 +792,7 @@ pub const ServerTicketStore = struct {
         entry.psk = psk;
         entry.issued_at_ms = issued_at_ms;
         entry.lifetime_s = lifetime_s;
+        entry.used_for_0rtt = false;
         const was_empty = self.entries[target] == null;
         self.entries[target] = entry;
         if (was_empty and self.count < MAX_ENTRIES) self.count += 1;
@@ -804,6 +806,23 @@ pub const ServerTicketStore = struct {
                 if (!std.mem.eql(u8, entry.ticket[0..entry.ticket_len], ticket_value)) continue;
                 const age_ms = now_ms - entry.issued_at_ms;
                 if (age_ms < 0 or age_ms > @as(i64, entry.lifetime_s) * 1000) continue;
+                return entry.psk;
+            }
+        }
+        return null;
+    }
+
+    /// Look up a PSK for 0-RTT and mark it as consumed (single-use anti-replay).
+    /// Returns null if not found, expired, or already used for 0-RTT.
+    pub fn consumeForZeroRtt(self: *ServerTicketStore, ticket_value: []const u8, now_ms: i64) ?[32]u8 {
+        for (&self.entries) |*slot| {
+            if (slot.*) |*entry| {
+                if (entry.ticket_len != ticket_value.len) continue;
+                if (!std.mem.eql(u8, entry.ticket[0..entry.ticket_len], ticket_value)) continue;
+                const age_ms = now_ms - entry.issued_at_ms;
+                if (age_ms < 0 or age_ms > @as(i64, entry.lifetime_s) * 1000) continue;
+                if (entry.used_for_0rtt) return null;
+                entry.used_for_0rtt = true;
                 return entry.psk;
             }
         }
@@ -854,29 +873,30 @@ pub fn issueNewSessionTicket(
 }
 
 /// Validate a 0-RTT attempt: look up the PSK from the ticket store and derive early keys.
-/// Returns the early keys for decrypting 0-RTT data, or null if ticket is invalid/expired.
+/// Marks the ticket as consumed for anti-replay (single-use 0-RTT).
+/// Returns the early keys for decrypting 0-RTT data, or null if ticket is invalid/expired/replayed.
 pub fn validate0Rtt(
     parsed_ch: *const ParsedClientHello,
     ch_raw: []const u8,
-    ticket_store: *const ServerTicketStore,
+    ticket_store: *ServerTicketStore,
     now_ms: i64,
 ) ?@import("resumption.zig").EarlyKeys {
-    const resumption = @import("resumption.zig");
+    const resump = @import("resumption.zig");
 
     if (!parsed_ch.has_psk or !parsed_ch.has_early_data) return null;
 
-    // Look up PSK by ticket (identity)
-    const psk = ticket_store.lookup(
+    // Look up and consume PSK (anti-replay: single-use for 0-RTT)
+    const psk = ticket_store.consumeForZeroRtt(
         parsed_ch.psk_identity[0..parsed_ch.psk_identity_len],
         now_ms,
     ) orelse return null;
 
     // Derive early keys from PSK and ClientHello hash
-    const early_secret = resumption.deriveEarlySecret(psk);
+    const early_secret = resump.deriveEarlySecret(psk);
     var ch_hash: [32]u8 = undefined;
     Sha256.hash(ch_raw, &ch_hash, .{});
 
-    return resumption.deriveEarlyKeys(early_secret, ch_hash);
+    return resump.deriveEarlyKeys(early_secret, ch_hash);
 }
 
 // ─── Tests ───
@@ -1028,6 +1048,37 @@ test "ServerTicketStore: store and lookup" {
     // Lookup with wrong ticket
     const wrong = [_]u8{0xDD} ** 32;
     try std.testing.expect(store.lookup(&wrong, 2000) == null);
+}
+
+test "ServerTicketStore: consumeForZeroRtt single-use anti-replay" {
+    var store = ServerTicketStore.init();
+    const ticket = [_]u8{0xEE} ** 32;
+    const psk = [_]u8{0xFF} ** 32;
+    store.store(&ticket, psk, 1000, 3600);
+
+    // First consume succeeds
+    const first = store.consumeForZeroRtt(&ticket, 2000);
+    try std.testing.expect(first != null);
+    try std.testing.expectEqualSlices(u8, &psk, &first.?);
+
+    // Second consume is rejected (replay)
+    const replay = store.consumeForZeroRtt(&ticket, 2001);
+    try std.testing.expect(replay == null);
+
+    // Regular lookup still works (1-RTT resumption unaffected)
+    const regular = store.lookup(&ticket, 2002);
+    try std.testing.expect(regular != null);
+}
+
+test "ServerTicketStore: consumeForZeroRtt rejects expired" {
+    var store = ServerTicketStore.init();
+    const ticket = [_]u8{0xAA} ** 32;
+    const psk = [_]u8{0xBB} ** 32;
+    store.store(&ticket, psk, 1000, 1); // 1 second lifetime
+
+    // Expired — should be rejected
+    const result = store.consumeForZeroRtt(&ticket, 1000 + 1001);
+    try std.testing.expect(result == null);
 }
 
 test "parseClientHello: PSK fields default to false" {
