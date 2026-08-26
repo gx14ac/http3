@@ -516,7 +516,7 @@ pub const Channel = struct {
         const framed = try self.frameMessage(request_data, opts.max_send_message_size);
         defer self.allocator.free(framed);
 
-        const headers = try buildGrpcHeaders(opts.metadata, opts.timeout_ms);
+        var headers = try buildGrpcHeaders(opts.metadata, opts.timeout_ms);
 
         if (isDeadlineExceeded(deadline)) return ChannelError.DeadlineExceeded;
 
@@ -596,7 +596,7 @@ pub const Channel = struct {
         const framed = try self.frameMessage(payload, opts.max_send_message_size);
         defer self.allocator.free(framed);
 
-        const headers = try buildGrpcHeaders(opts.metadata, opts.timeout_ms);
+        var headers = try buildGrpcHeaders(opts.metadata, opts.timeout_ms);
 
         const client = self.activeClient();
         const handle = client.request(
@@ -651,7 +651,7 @@ pub const Channel = struct {
         try self.autoConnect();
         self.keepaliveCheck();
         if (self.channel_state == .disconnected) try self.autoConnect();
-        const headers = try buildGrpcHeaders(opts.metadata, opts.timeout_ms);
+        var headers = try buildGrpcHeaders(opts.metadata, opts.timeout_ms);
 
         const client = self.activeClient();
         const handle = client.request(
@@ -751,8 +751,17 @@ pub const Channel = struct {
         buf: [max_grpc_headers]h2_client.Header,
         count: usize,
         timeout_buf: [32]u8,
+        timeout_len: usize = 0,
 
-        fn slice(self: *const GrpcHeaders) []const h2_client.Header {
+        fn slice(self: *GrpcHeaders) []const h2_client.Header {
+            if (self.timeout_len > 0) {
+                for (self.buf[0..self.count]) |*h| {
+                    if (std.mem.eql(u8, h.name, "grpc-timeout")) {
+                        h.value = self.timeout_buf[0..self.timeout_len];
+                        break;
+                    }
+                }
+            }
             return self.buf[0..self.count];
         }
     };
@@ -773,6 +782,7 @@ pub const Channel = struct {
 
         if (timeout_ms > 0) {
             const timeout_val = encodeGrpcTimeout(timeout_ms, &result.timeout_buf);
+            result.timeout_len = timeout_val.len;
             result.buf[result.count] = .{ .name = "grpc-timeout", .value = timeout_val };
             result.count += 1;
         }

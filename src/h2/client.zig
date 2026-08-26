@@ -129,11 +129,17 @@ pub const Client = struct {
         self.conn.sendClientPreface() catch return ClientError.IoError;
         self.conn.recvServerPreface() catch |e| return mapConnError(e);
 
-        const event = self.conn.recvFrame() catch |e| return mapConnError(e);
-        switch (event) {
-            .settings_ack => {},
-            else => return ClientError.ProtocolError,
+        // Server may send WINDOW_UPDATE or other frames before SETTINGS ACK
+        var attempts: u8 = 0;
+        while (attempts < 10) : (attempts += 1) {
+            const event = self.conn.recvFrame() catch |e| return mapConnError(e);
+            switch (event) {
+                .settings_ack => return,
+                .window_update => continue,
+                else => return ClientError.ProtocolError,
+            }
         }
+        return ClientError.ProtocolError;
     }
 
     pub fn request(
@@ -269,7 +275,9 @@ pub const Client = struct {
 
         // Read from wire, buffering frames for other streams
         while (true) {
-            const event = self.conn.recvFrame() catch |e| return mapConnError(e);
+            const event = self.conn.recvFrame() catch |e| {
+                return mapConnError(e);
+            };
             switch (event) {
                 .headers => |h| {
                     if (h.stream_id != handle.stream_id) {
@@ -306,7 +314,9 @@ pub const Client = struct {
                         hdr_payload[0..total_len],
                         header_out,
                         decode_buf,
-                    ) catch return ClientError.InvalidResponse;
+                    ) catch {
+                        return ClientError.InvalidResponse;
+                    };
 
                     status = parseStatus(header_out[0..header_count]);
                     got_headers = true;

@@ -611,7 +611,6 @@ pub fn huffmanDecode(input: []const u8, output: []u8) !usize {
                 out_pos += 1;
                 state = 0;
             } else if (entry.flags & 0x02 != 0) {
-                // EOS or invalid
                 return error.HuffmanDecodingError;
             } else {
                 state = entry.next_state;
@@ -621,11 +620,10 @@ pub fn huffmanDecode(input: []const u8, output: []u8) !usize {
 
     // Verify we ended in an accepting state (partial EOS padding is OK)
     if (state != 0) {
-        // Check if remaining bits are all 1s (valid EOS padding)
-        // State 0 means clean boundary, any other state means we're mid-symbol
-        // which is only valid if it's EOS padding
         const entry = huffman_decode_table[state][1];
-        if (entry.flags & 0x04 == 0) return error.HuffmanDecodingError;
+        if (entry.flags & 0x04 == 0) {
+            return error.HuffmanDecodingError;
+        }
     }
 
     return out_pos;
