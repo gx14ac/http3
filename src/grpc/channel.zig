@@ -22,9 +22,8 @@ fn sleepNs(ns: u64) void {
     };
     while (true) {
         var rem: libc.timespec = undefined;
-        const rc = libc.nanosleep(&req, &rem);
-        if (rc == 0) return;
-        if (rc == -1) {
+        if (libc.nanosleep(&req, &rem) == 0) return;
+        if (libc.errno(-1) == .INTR) {
             req = rem;
         } else return;
     }
