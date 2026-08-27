@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../io/compat.zig");
 const channel_mod = @import("channel.zig");
 const resolver_mod = @import("resolver.zig");
 const balancer_mod = @import("balancer.zig");
@@ -625,14 +626,14 @@ test "E2E: ConnPool acquires connection and serves unary RPC" {
     defer pool.deinit();
 
     // Create channel with pool (not managed mode)
-    const dummy_reader = std.io.AnyReader{ .context = @ptrCast(&struct {
+    const dummy_reader = compat.AnyReader{ .context = @ptrCast(&struct {
         const x: u8 = 0;
     }.x), .readFn = struct {
         fn f(_: *const anyopaque, _: []u8) anyerror!usize {
             return 0;
         }
     }.f };
-    const dummy_writer = std.io.AnyWriter{ .context = @ptrCast(&struct {
+    const dummy_writer = compat.AnyWriter{ .context = @ptrCast(&struct {
         const x: u8 = 0;
     }.x), .writeFn = struct {
         fn f(_: *const anyopaque, data: []const u8) anyerror!usize {
@@ -690,14 +691,14 @@ test "E2E: ConnPool holds connection with channel affinity" {
     );
     defer pool.deinit();
 
-    const dummy_reader = std.io.AnyReader{ .context = @ptrCast(&struct {
+    const dummy_reader = compat.AnyReader{ .context = @ptrCast(&struct {
         const x: u8 = 0;
     }.x), .readFn = struct {
         fn f(_: *const anyopaque, _: []u8) anyerror!usize {
             return 0;
         }
     }.f };
-    const dummy_writer = std.io.AnyWriter{ .context = @ptrCast(&struct {
+    const dummy_writer = compat.AnyWriter{ .context = @ptrCast(&struct {
         const x: u8 = 0;
     }.x), .writeFn = struct {
         fn f(_: *const anyopaque, data: []const u8) anyerror!usize {

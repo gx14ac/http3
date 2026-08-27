@@ -13,7 +13,9 @@ pub const io = struct {
     pub const tcp = @import("io/tcp.zig");
     pub const TcpTransport = tcp.TcpTransport;
     pub const tls = @import("io/tls.zig");
-    pub const TlsTransport = tls.TlsTransport;
+    pub const compat = @import("io/compat.zig");
+    pub const AnyReader = compat.AnyReader;
+    pub const AnyWriter = compat.AnyWriter;
 };
 
 pub const grpc = @import("grpc/root.zig");

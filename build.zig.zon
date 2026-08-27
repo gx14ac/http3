@@ -1,0 +1,14 @@
+.{
+    .fingerprint = 0x482a2436c2c254ad,
+    .name = .http3,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.0",
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

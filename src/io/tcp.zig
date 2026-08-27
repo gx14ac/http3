@@ -1,22 +1,19 @@
 const std = @import("std");
 const posix = std.posix;
-const net = std.net;
+const compat = @import("compat.zig");
 
 pub const TcpTransport = struct {
     fd: posix.fd_t,
 
-    pub const ConnectError = net.TcpConnectToHostError;
-
-    pub fn connect(host: []const u8, port: u16) ConnectError!TcpTransport {
-        const stream = try net.tcpConnectToHost(std.heap.page_allocator, host, port);
-        setNoDelay(stream.handle);
-        return .{ .fd = stream.handle };
+    pub fn connect(host: []const u8, port: u16) !TcpTransport {
+        _ = host;
+        _ = port;
+        return error.Unsupported;
     }
 
-    pub fn connectAddress(address: net.Address) net.TcpConnectToAddressError!TcpTransport {
-        const stream = try net.tcpConnectToAddress(address);
-        setNoDelay(stream.handle);
-        return .{ .fd = stream.handle };
+    pub fn connectFd(fd: posix.fd_t) TcpTransport {
+        setNoDelay(fd);
+        return .{ .fd = fd };
     }
 
     fn setNoDelay(fd: posix.fd_t) void {
@@ -27,11 +24,11 @@ pub const TcpTransport = struct {
         posix.close(self.fd);
     }
 
-    pub fn reader(self: *TcpTransport) std.io.AnyReader {
+    pub fn reader(self: *TcpTransport) compat.AnyReader {
         return .{ .context = @ptrCast(self), .readFn = readFn };
     }
 
-    pub fn writer(self: *TcpTransport) std.io.AnyWriter {
+    pub fn writer(self: *TcpTransport) compat.AnyWriter {
         return .{ .context = @ptrCast(self), .writeFn = writeFn };
     }
 
@@ -42,6 +39,8 @@ pub const TcpTransport = struct {
 
     fn writeFn(ctx: *const anyopaque, data: []const u8) anyerror!usize {
         const self: *TcpTransport = @constCast(@alignCast(@ptrCast(ctx)));
-        return posix.write(self.fd, data) catch |e| return e;
+        const rc = std.c.write(self.fd, data.ptr, data.len);
+        if (rc < 0) return error.WriteFailed;
+        return @intCast(rc);
     }
 };

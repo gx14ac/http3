@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../io/compat.zig");
 const frame = @import("frame.zig");
 const stream_mod = @import("stream.zig");
 const hpack = @import("hpack.zig");
@@ -65,8 +66,8 @@ pub const Connection = struct {
     last_peer_stream_id: u31,
     goaway_info: ?GoawayInfo,
     expecting_continuation: ?u31,
-    reader: std.io.AnyReader,
-    writer: std.io.AnyWriter,
+    reader: compat.AnyReader,
+    writer: compat.AnyWriter,
 
     // Payload tracking: bytes remaining from last HEADERS/DATA/CONTINUATION event
     pending_payload: u24,
@@ -80,7 +81,7 @@ pub const Connection = struct {
     max_empty_frames: u32,
     data_received_since_ping: bool,
 
-    pub fn init(reader: std.io.AnyReader, writer: std.io.AnyWriter, config: Config) Connection {
+    pub fn init(reader: compat.AnyReader, writer: compat.AnyWriter, config: Config) Connection {
         const local = frame.Settings{
             .header_table_size = config.header_table_size,
             .enable_push = config.enable_push,
@@ -331,7 +332,7 @@ pub const Connection = struct {
     }
 
     /// Replace the underlying transport (for reconnect). Resets connection state.
-    pub fn replaceTransport(self: *Connection, reader: std.io.AnyReader, writer: std.io.AnyWriter) void {
+    pub fn replaceTransport(self: *Connection, reader: compat.AnyReader, writer: compat.AnyWriter) void {
         self.reader = reader;
         self.writer = writer;
         self.state = .idle;

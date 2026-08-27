@@ -1,9 +1,16 @@
 const std = @import("std");
+const libc = std.c;
 const dialer_mod = @import("dialer.zig");
 const resolver_mod = @import("resolver.zig");
 const h2_client = @import("../h2/client.zig");
 const h2_hpack = @import("../h2/hpack.zig");
 const h2_connection = @import("../h2/connection.zig");
+
+fn monotonicNs() i128 {
+    var ts: libc.timespec = undefined;
+    _ = libc.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, @intCast(ts.sec)) * 1_000_000_000 + @as(i128, @intCast(ts.nsec));
+}
 
 const Dialer = dialer_mod.Dialer;
 const DialResult = dialer_mod.DialResult;
@@ -98,7 +105,7 @@ pub const ConnPool = struct {
 
         if (best) |conn| {
             conn.active_streams += 1;
-            conn.last_used_ns = std.time.nanoTimestamp();
+            conn.last_used_ns = monotonicNs();
             conn.state = .active;
             return conn;
         }
@@ -122,7 +129,7 @@ pub const ConnPool = struct {
         if (conn.active_streams == 0) {
             conn.state = .idle;
         }
-        conn.last_used_ns = std.time.nanoTimestamp();
+        conn.last_used_ns = monotonicNs();
     }
 
     /// Mark a connection as failed (will be evicted on next acquire).
@@ -200,7 +207,7 @@ pub const ConnPool = struct {
             return PoolError.ConnectionFailed;
         };
 
-        const now = std.time.nanoTimestamp();
+        const now = monotonicNs();
         self.conns[idx] = .{
             .client = client,
             .dial_result = dial_result,
@@ -216,7 +223,7 @@ pub const ConnPool = struct {
     }
 
     fn evictStale(self: *ConnPool) void {
-        const now = std.time.nanoTimestamp();
+        const now = monotonicNs();
         const idle_timeout_ns: i128 = @as(i128, self.config.idle_timeout_ms) * 1_000_000;
 
         for (&self.conns) |*slot| {
@@ -316,8 +323,8 @@ test "ConnPool: release decrements active streams" {
         .dial_result = undefined,
         .state = .active,
         .active_streams = 3,
-        .created_ns = std.time.nanoTimestamp(),
-        .last_used_ns = std.time.nanoTimestamp(),
+        .created_ns = monotonicNs(),
+        .last_used_ns = monotonicNs(),
         .id = 0,
     };
     pool.conn_count = 1;
@@ -354,8 +361,8 @@ test "ConnPool: markFailed sets state to closed" {
         .dial_result = undefined,
         .state = .active,
         .active_streams = 1,
-        .created_ns = std.time.nanoTimestamp(),
-        .last_used_ns = std.time.nanoTimestamp(),
+        .created_ns = monotonicNs(),
+        .last_used_ns = monotonicNs(),
         .id = 0,
     };
     pool.conn_count = 1;
@@ -381,7 +388,7 @@ test "ConnPool: least-loaded selection" {
     );
     defer pool.deinit();
 
-    const now = std.time.nanoTimestamp();
+    const now = monotonicNs();
     pool.conns[0] = .{
         .client = undefined,
         .dial_result = undefined,
@@ -425,7 +432,7 @@ test "ConnPool: markDraining excludes from acquire" {
     );
     defer pool.deinit();
 
-    const now = std.time.nanoTimestamp();
+    const now = monotonicNs();
     pool.conns[0] = .{
         .client = undefined,
         .dial_result = undefined,
@@ -471,7 +478,7 @@ test "ConnPool: draining conn evicted when streams complete" {
     );
     defer pool.deinit();
 
-    const now = std.time.nanoTimestamp();
+    const now = monotonicNs();
     pool.conns[0] = .{
         .client = undefined,
         .dial_result = undefined,

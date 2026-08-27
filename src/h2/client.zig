@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../io/compat.zig");
 const frame = @import("frame.zig");
 const stream_mod = @import("stream.zig");
 const hpack = @import("hpack.zig");
@@ -86,7 +87,7 @@ pub const Client = struct {
         frames: std.ArrayListUnmanaged(BufferedFrame),
 
         fn init() FrameQueue {
-            return .{ .frames = .{} };
+            return .{ .frames = .empty };
         }
 
         fn deinit(self: *FrameQueue, allocator: std.mem.Allocator) void {
@@ -106,7 +107,7 @@ pub const Client = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, reader: std.io.AnyReader, writer: std.io.AnyWriter, config: Config) Client {
+    pub fn init(allocator: std.mem.Allocator, reader: compat.AnyReader, writer: compat.AnyWriter, config: Config) Client {
         return .{
             .conn = Connection.init(reader, writer, config),
             .encoder = hpack.Encoder.init(config.header_table_size),
@@ -631,11 +632,11 @@ const TestPipe = struct {
         self.write_buf.deinit(self.allocator);
     }
 
-    fn reader(self: *TestPipe) std.io.AnyReader {
+    fn reader(self: *TestPipe) compat.AnyReader {
         return .{ .context = @ptrCast(self), .readFn = readFn };
     }
 
-    fn writer(self: *TestPipe) std.io.AnyWriter {
+    fn writer(self: *TestPipe) compat.AnyWriter {
         return .{ .context = @ptrCast(self), .writeFn = writeFn };
     }
 

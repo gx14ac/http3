@@ -1,4 +1,6 @@
 const std = @import("std");
+const libc = std.c;
+const compat = @import("../io/compat.zig");
 const message = @import("message.zig");
 const grpc_status = @import("status.zig");
 const interceptor = @import("interceptor.zig");
@@ -6,6 +8,27 @@ const stream_interceptor = @import("stream_interceptor.zig");
 const resolver_mod = @import("resolver.zig");
 const balancer_mod = @import("balancer.zig");
 const dialer_mod = @import("dialer.zig");
+
+fn monotonicNs() i128 {
+    var ts: libc.timespec = undefined;
+    _ = libc.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, @intCast(ts.sec)) * 1_000_000_000 + @as(i128, @intCast(ts.nsec));
+}
+
+fn sleepNs(ns: u64) void {
+    var req = libc.timespec{
+        .sec = @intCast(ns / 1_000_000_000),
+        .nsec = @intCast(ns % 1_000_000_000),
+    };
+    while (true) {
+        var rem: libc.timespec = undefined;
+        const rc = libc.nanosleep(&req, &rem);
+        if (rc == 0) return;
+        if (rc == -1) {
+            req = rem;
+        } else return;
+    }
+}
 
 const h2_client = @import("../h2/client.zig");
 const h2_frame = @import("../h2/frame.zig");
@@ -110,26 +133,26 @@ pub fn encodeGrpcTimeout(timeout_ms: u64, buf: *[32]u8) []const u8 {
 /// Returns null if timeout_ms is 0 (no deadline).
 fn computeDeadlineNs(timeout_ms: u64) ?i128 {
     if (timeout_ms == 0) return null;
-    const now = std.time.nanoTimestamp();
+    const now = monotonicNs();
     return now + @as(i128, timeout_ms) * 1_000_000;
 }
 
 /// Check if a deadline has been exceeded. Returns true if expired.
 fn isDeadlineExceeded(deadline_ns: ?i128) bool {
     const dl = deadline_ns orelse return false;
-    return std.time.nanoTimestamp() >= dl;
+    return monotonicNs() >= dl;
 }
 
 /// Sleep for the retry backoff duration. Single point of sleep for future async swap.
 fn retryBackoff(backoff_ms: u64) void {
     const ns: u64 = backoff_ms * 1_000_000;
-    std.Thread.sleep(ns);
+    sleepNs(ns);
 }
 
 /// Check if there's enough remaining time before the deadline for a backoff + attempt.
 fn hasTimeForRetry(deadline_ns: ?i128, backoff_ms: u64) bool {
     const dl = deadline_ns orelse return true;
-    const now = std.time.nanoTimestamp();
+    const now = monotonicNs();
     const needed: i128 = @as(i128, backoff_ms) * 1_000_000;
     return (dl - now) > needed;
 }
@@ -181,8 +204,8 @@ pub const Channel = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        reader: std.io.AnyReader,
-        writer: std.io.AnyWriter,
+        reader: compat.AnyReader,
+        writer: compat.AnyWriter,
         authority: []const u8,
         config: h2_client.Config,
     ) Channel {
@@ -209,10 +232,10 @@ pub const Channel = struct {
         d: dialer_mod.Dialer,
     ) Channel {
         // Initialize client with dummy reader/writer — connect() will set real ones
-        const dummy_reader = std.io.AnyReader{ .context = @ptrCast(&struct {
+        const dummy_reader = compat.AnyReader{ .context = @ptrCast(&struct {
             const x: u8 = 0;
         }.x), .readFn = dummyRead };
-        const dummy_writer = std.io.AnyWriter{ .context = @ptrCast(&struct {
+        const dummy_writer = compat.AnyWriter{ .context = @ptrCast(&struct {
             const x: u8 = 0;
         }.x), .writeFn = dummyWrite };
 
@@ -297,7 +320,7 @@ pub const Channel = struct {
 
     /// Reconnect with new transport after a disconnect or GOAWAY.
     /// Caller must provide fresh reader/writer (e.g. from a new TCP connection).
-    pub fn reconnect(self: *Channel, reader: std.io.AnyReader, writer: std.io.AnyWriter) ChannelError!void {
+    pub fn reconnect(self: *Channel, reader: compat.AnyReader, writer: compat.AnyWriter) ChannelError!void {
         if (self.channel_state == .shutdown) return ChannelError.ConnectionClosed;
         self.client.conn.replaceTransport(reader, writer);
         self.client.encoder = h2_hpack.Encoder.init(self.config.header_table_size);
@@ -454,7 +477,7 @@ pub const Channel = struct {
         if (self.keepalive.interval_ms == 0) return;
         if (self.channel_state != .connected) return;
 
-        const now = std.time.nanoTimestamp();
+        const now = monotonicNs();
 
         // Check if outstanding ping has timed out
         if (self.ping_outstanding) {
@@ -485,7 +508,7 @@ pub const Channel = struct {
 
     /// Record activity (successful data exchange). Resets keepalive timer.
     fn recordActivity(self: *Channel) void {
-        self.last_activity_ns = std.time.nanoTimestamp();
+        self.last_activity_ns = monotonicNs();
         self.ping_outstanding = false;
     }
 
@@ -613,7 +636,7 @@ pub const Channel = struct {
             .max_recv_message_size = opts.max_recv_message_size,
             .max_send_message_size = opts.max_send_message_size,
             .allocator = self.allocator,
-            .recv_buf = .{},
+            .recv_buf = .empty,
             .recv_buf_pos = 0,
             .final_status = null,
             .send_closed = true,
@@ -668,7 +691,7 @@ pub const Channel = struct {
             .max_recv_message_size = opts.max_recv_message_size,
             .max_send_message_size = opts.max_send_message_size,
             .allocator = self.allocator,
-            .recv_buf = .{},
+            .recv_buf = .empty,
             .recv_buf_pos = 0,
             .final_status = null,
             .send_closed = false,
@@ -1104,11 +1127,11 @@ const TestPipe = struct {
         self.write_buf.deinit(self.allocator);
     }
 
-    fn reader(self: *TestPipe) std.io.AnyReader {
+    fn reader(self: *TestPipe) compat.AnyReader {
         return .{ .context = @ptrCast(self), .readFn = readFn };
     }
 
-    fn writer(self: *TestPipe) std.io.AnyWriter {
+    fn writer(self: *TestPipe) compat.AnyWriter {
         return .{ .context = @ptrCast(self), .writeFn = writeFn };
     }
 
@@ -1539,7 +1562,7 @@ test "computeDeadlineNs returns null for zero timeout" {
 
 test "computeDeadlineNs returns future timestamp" {
     const deadline = computeDeadlineNs(1000).?;
-    const now = std.time.nanoTimestamp();
+    const now = monotonicNs();
     try std.testing.expect(deadline > now);
 }
 
@@ -1548,12 +1571,12 @@ test "isDeadlineExceeded null deadline never expires" {
 }
 
 test "isDeadlineExceeded past deadline" {
-    const past: i128 = std.time.nanoTimestamp() - 1_000_000_000;
+    const past: i128 = monotonicNs() - 1_000_000_000;
     try std.testing.expect(isDeadlineExceeded(past));
 }
 
 test "isDeadlineExceeded future deadline" {
-    const future: i128 = std.time.nanoTimestamp() + 60_000_000_000;
+    const future: i128 = monotonicNs() + 60_000_000_000;
     try std.testing.expect(!isDeadlineExceeded(future));
 }
 
@@ -2066,7 +2089,7 @@ test "keepalive: sends ping after interval elapsed" {
     ch.withKeepalive(.{ .interval_ms = 1, .timeout_ms = 5000 });
 
     // Simulate elapsed time by backdating last_activity
-    ch.last_activity_ns = std.time.nanoTimestamp() - 10_000_000; // 10ms ago
+    ch.last_activity_ns = monotonicNs() - 10_000_000; // 10ms ago
 
     ch.keepaliveCheck();
     // Ping should be sent (or fail due to pipe — either way, state is set)
@@ -2091,7 +2114,7 @@ test "keepalive: timeout triggers disconnect" {
 
     // Simulate: ping was sent 10ms ago, no ack received
     ch.ping_outstanding = true;
-    ch.ping_sent_ns = std.time.nanoTimestamp() - 10_000_000; // 10ms ago, timeout is 1ms
+    ch.ping_sent_ns = monotonicNs() - 10_000_000; // 10ms ago, timeout is 1ms
 
     ch.keepaliveCheck();
     try std.testing.expectEqual(ChannelState.disconnected, ch.channel_state);
@@ -2112,7 +2135,7 @@ test "keepalive: recordActivity resets state" {
     try ch.handshake();
 
     ch.ping_outstanding = true;
-    ch.ping_sent_ns = std.time.nanoTimestamp();
+    ch.ping_sent_ns = monotonicNs();
 
     ch.recordActivity();
     try std.testing.expect(!ch.ping_outstanding);
@@ -2143,7 +2166,7 @@ test "channel: GOAWAY marks pooled conn as draining not failed" {
     );
     defer pool.deinit();
 
-    const now = std.time.nanoTimestamp();
+    const now = monotonicNs();
     pool.conns[0] = .{
         .client = undefined,
         .dial_result = undefined,
@@ -2196,7 +2219,7 @@ test "channel: IO error marks pooled conn as failed" {
     );
     defer pool.deinit();
 
-    const now = std.time.nanoTimestamp();
+    const now = monotonicNs();
     pool.conns[0] = .{
         .client = undefined,
         .dial_result = undefined,

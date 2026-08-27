@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../io/compat.zig");
 const frame = @import("frame.zig");
 
 pub const TestPipe = struct {
@@ -20,11 +21,11 @@ pub const TestPipe = struct {
         self.write_buf.deinit(self.allocator);
     }
 
-    pub fn reader(self: *TestPipe) std.io.AnyReader {
+    pub fn reader(self: *TestPipe) compat.AnyReader {
         return .{ .context = @ptrCast(self), .readFn = readFn };
     }
 
-    pub fn writer(self: *TestPipe) std.io.AnyWriter {
+    pub fn writer(self: *TestPipe) compat.AnyWriter {
         return .{ .context = @ptrCast(self), .writeFn = writeFn };
     }
 
