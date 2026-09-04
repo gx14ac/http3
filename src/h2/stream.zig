@@ -29,15 +29,17 @@ pub const FlowWindow = struct {
     }
 
     pub fn consume(self: *FlowWindow, amount: u32) error{FlowControlError}!void {
-        const new = self.size - @as(i32, @intCast(amount));
+        const current = @atomicLoad(i32, &self.size, .acquire);
+        const new = current - @as(i32, @intCast(amount));
         if (new < 0) return error.FlowControlError;
-        self.size = new;
+        _ = @atomicRmw(i32, &self.size, .Sub, @as(i32, @intCast(amount)), .release);
     }
 
     pub fn credit(self: *FlowWindow, increment: u31) error{FlowControlError}!void {
-        const new = @as(i64, self.size) + @as(i64, increment);
+        const current = @atomicLoad(i32, &self.size, .acquire);
+        const new = @as(i64, current) + @as(i64, increment);
         if (new > 0x7FFFFFFF) return error.FlowControlError;
-        self.size = @intCast(new);
+        _ = @atomicRmw(i32, &self.size, .Add, @as(i32, increment), .release);
     }
 
     pub fn available(self: FlowWindow) u32 {
@@ -47,9 +49,11 @@ pub const FlowWindow = struct {
 
     pub fn updateInitialSize(self: *FlowWindow, old_initial: u32, new_initial: u32) error{FlowControlError}!void {
         const delta = @as(i64, new_initial) - @as(i64, old_initial);
-        const new = @as(i64, self.size) + delta;
+        const current = @atomicLoad(i32, &self.size, .acquire);
+        const new = @as(i64, current) + delta;
         if (new > 0x7FFFFFFF or new < -0x80000000) return error.FlowControlError;
-        self.size = @intCast(new);
+        const delta_i32: i32 = @intCast(delta);
+        _ = @atomicRmw(i32, &self.size, .Add, delta_i32, .release);
     }
 };
 

@@ -56,6 +56,20 @@ pub const State = enum {
     closed,
 };
 
+const SpinMutex = struct {
+    state: std.atomic.Value(u8) = .init(0),
+
+    pub fn lock(self: *SpinMutex) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn unlock(self: *SpinMutex) void {
+        self.state.store(0, .release);
+    }
+};
+
 pub const Connection = struct {
     state: State,
     local_settings: frame.Settings,
@@ -68,6 +82,7 @@ pub const Connection = struct {
     expecting_continuation: ?u31,
     reader: compat.AnyReader,
     writer: compat.AnyWriter,
+    write_mu: SpinMutex = .{},
 
     // Payload tracking: bytes remaining from last HEADERS/DATA/CONTINUATION event
     pending_payload: u24,
@@ -237,6 +252,8 @@ pub const Connection = struct {
         };
         var buf: [9]u8 = undefined;
         fh.encode(&buf);
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
         self.writeAll(&buf) catch return ConnectionError.IoError;
         self.writeAll(header_block) catch return ConnectionError.IoError;
     }
@@ -255,6 +272,8 @@ pub const Connection = struct {
         };
         var buf: [9]u8 = undefined;
         fh.encode(&buf);
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
         self.writeAll(&buf) catch return ConnectionError.IoError;
         if (data.len > 0) {
             self.writeAll(data) catch return ConnectionError.IoError;
@@ -265,6 +284,8 @@ pub const Connection = struct {
     pub fn sendPing(self: *Connection, opaque_data: [8]u8) ConnectionError!void {
         var buf: [17]u8 = undefined;
         _ = frame.buildPing(opaque_data, &buf);
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
         self.writeAll(&buf) catch return ConnectionError.IoError;
     }
 
@@ -273,6 +294,8 @@ pub const Connection = struct {
         var buf: [256]u8 = undefined;
         const result = frame.buildGoaway(self.last_peer_stream_id, error_code, debug_data, &buf) catch
             return ConnectionError.FrameSizeError;
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
         self.writeAll(result) catch return ConnectionError.IoError;
         self.state = .goaway_sent;
     }
@@ -282,6 +305,8 @@ pub const Connection = struct {
         var buf: [13]u8 = undefined;
         _ = frame.buildWindowUpdate(stream_id, increment, &buf) catch
             return ConnectionError.ProtocolError;
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
         self.writeAll(&buf) catch return ConnectionError.IoError;
     }
 
@@ -289,6 +314,8 @@ pub const Connection = struct {
     pub fn sendRstStream(self: *Connection, stream_id: u31, error_code: frame.ErrorCode) ConnectionError!void {
         var buf: [13]u8 = undefined;
         _ = frame.buildRstStream(stream_id, error_code, &buf);
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
         self.writeAll(&buf) catch return ConnectionError.IoError;
     }
 
@@ -391,7 +418,11 @@ pub const Connection = struct {
         }
         var resp_buf: [17]u8 = undefined;
         _ = frame.buildPingAck(data, &resp_buf);
-        self.writeAll(&resp_buf) catch return ConnectionError.IoError;
+        {
+            self.write_mu.lock();
+            defer self.write_mu.unlock();
+            self.writeAll(&resp_buf) catch return ConnectionError.IoError;
+        }
         return null;
     }
 
@@ -477,6 +508,8 @@ pub const Connection = struct {
     fn sendSettingsAck(self: *Connection) anyerror!void {
         var buf: [9]u8 = undefined;
         _ = frame.buildSettingsAck(&buf);
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
         try self.writeAll(&buf);
     }
 
