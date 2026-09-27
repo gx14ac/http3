@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 /// HPACK Huffman coding tables (RFC 7541 Appendix B)
 /// Generated from the canonical Huffman code table.
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 const quic_crypto = @import("crypto.zig");
 const handshake_mod = @import("handshake.zig");

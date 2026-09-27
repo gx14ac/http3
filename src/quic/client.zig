@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 const connection_mod = @import("connection.zig");
 const socket_mod = @import("socket.zig");

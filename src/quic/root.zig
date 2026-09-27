@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 pub const packet = @import("packet.zig");
 pub const crypto = @import("crypto.zig");
 pub const socket = @import("socket.zig");

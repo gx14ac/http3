@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 const tls_dialer_mod = @import("grpc/tls_dialer.zig");
 const resolver_mod = @import("grpc/resolver.zig");

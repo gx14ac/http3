@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 /// gRPC status codes (https://grpc.github.io/grpc/core/md_doc_statuscodes.html)
 pub const Code = enum(u8) {
     ok = 0,
