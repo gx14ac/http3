@@ -17,6 +17,7 @@ pub const io = struct {
     pub const TcpTransport = tcp.TcpTransport;
     pub const tls = @import("io/tls.zig");
     pub const compat = @import("io/compat.zig");
+    pub const clock = @import("io/clock.zig");
     pub const AnyReader = compat.AnyReader;
     pub const AnyWriter = compat.AnyWriter;
 };
@@ -35,6 +36,7 @@ test {
     _ = h2.fuzz_test;
     _ = io.tcp;
     _ = io.tls;
+    _ = io.clock;
     _ = grpc;
     _ = quic;
 }

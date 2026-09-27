@@ -9,11 +9,7 @@ const h2_client = @import("../h2/client.zig");
 const h2_hpack = @import("../h2/hpack.zig");
 const h2_connection = @import("../h2/connection.zig");
 
-fn monotonicNs() i128 {
-    var ts: libc.timespec = undefined;
-    _ = libc.clock_gettime(.MONOTONIC, &ts);
-    return @as(i128, @intCast(ts.sec)) * 1_000_000_000 + @as(i128, @intCast(ts.nsec));
-}
+const monotonicNs = @import("../io/clock.zig").monotonicNs;
 
 const Dialer = dialer_mod.Dialer;
 const DialResult = dialer_mod.DialResult;
