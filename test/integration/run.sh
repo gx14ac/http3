@@ -1,4 +1,7 @@
 #!/bin/sh
+# Copyright (c) 2026 gx14ac
+# SPDX-License-Identifier: Apache-2.0
+
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 const h3_client_mod = @import("h3_client.zig");
 const h3_server_mod = @import("h3_server.zig");

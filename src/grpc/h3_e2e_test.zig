@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 const h3_channel_mod = @import("h3_channel.zig");
 const h3_health_mod = @import("h3_health.zig");

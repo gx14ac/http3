@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 pub const h2 = struct {
     pub const frame = @import("h2/frame.zig");
     pub const hpack = @import("h2/hpack.zig");
