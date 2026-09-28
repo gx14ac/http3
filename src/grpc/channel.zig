@@ -12,25 +12,9 @@ const resolver_mod = @import("resolver.zig");
 const balancer_mod = @import("balancer.zig");
 const dialer_mod = @import("dialer.zig");
 
-fn monotonicNs() i128 {
-    var ts: libc.timespec = undefined;
-    _ = libc.clock_gettime(.MONOTONIC, &ts);
-    return @as(i128, @intCast(ts.sec)) * 1_000_000_000 + @as(i128, @intCast(ts.nsec));
-}
-
-fn sleepNs(ns: u64) void {
-    var req = libc.timespec{
-        .sec = @intCast(ns / 1_000_000_000),
-        .nsec = @intCast(ns % 1_000_000_000),
-    };
-    while (true) {
-        var rem: libc.timespec = undefined;
-        if (libc.nanosleep(&req, &rem) == 0) return;
-        if (libc.errno(-1) == .INTR) {
-            req = rem;
-        } else return;
-    }
-}
+const clock = @import("../io/clock.zig");
+const monotonicNs = clock.monotonicNs;
+const sleepNs = clock.sleepNs;
 
 const h2_client = @import("../h2/client.zig");
 const h2_frame = @import("../h2/frame.zig");
