@@ -20,6 +20,7 @@ const h2_client = @import("../h2/client.zig");
 const h2_frame = @import("../h2/frame.zig");
 const h2_hpack = @import("../h2/hpack.zig");
 const h2_connection = @import("../h2/connection.zig");
+const h2_stream = @import("../h2/stream.zig");
 const conn_pool_mod = @import("conn_pool.zig");
 
 pub const ChannelError = error{
@@ -538,6 +539,12 @@ pub const Channel = struct {
             .{ .extra_headers = headers.slice(), .end_stream = true },
         ) catch |e| return self.mapAndTrackError(e);
 
+        // From here the stream is open on the connection. A failure before
+        // the response has ended it — a deadline, a read that broke, a body
+        // too large for the buffer — resets it, or it would hold its slot
+        // for as long as the connection lives.
+        errdefer resetStream(client, handle.stream_id);
+
         if (isDeadlineExceeded(deadline)) return ChannelError.DeadlineExceeded;
 
         var resp_headers: [32]h2_hpack.HeaderField = undefined;
@@ -1022,6 +1029,9 @@ pub const StreamHandle = struct {
                         self.final_status = parsed;
                     }
 
+                    // The HTTP/2 stream moves with it: trailers end it, and
+                    // a stream left short of .closed keeps its slot.
+                    if (self.h2Stream()) |s| s.recvHeaders(h.end_stream) catch {};
                     if (h.end_stream) {
                         self.recv_closed = true;
                         return null;
@@ -1029,6 +1039,7 @@ pub const StreamHandle = struct {
                 },
                 .rst_stream => |r| {
                     if (r.stream_id == self.handle.stream_id) {
+                        if (self.h2Stream()) |s| s.recvReset();
                         self.recv_closed = true;
                         self.final_status = .{ .code = .internal, .message = "stream reset" };
                         return null;
@@ -1064,10 +1075,33 @@ pub const StreamHandle = struct {
         return self.final_status orelse grpc_status.Status.ok;
     }
 
+    /// Free the handle, and the HTTP/2 stream under it: one the peer has
+    /// not finished is reset, so that its slot comes back and the peer
+    /// stops sending on it. A caller that stops reading early — on an
+    /// error, or because it has what it wanted — would otherwise leave the
+    /// stream open for the life of the connection.
     pub fn deinit(self: *StreamHandle) void {
+        if (self.h2Stream()) |s| {
+            if (!s.isClosed()) {
+                self.client.conn.sendRstStream(self.handle.stream_id, .cancel) catch {};
+                s.sendReset(.cancel);
+            }
+        }
         self.recv_buf.deinit(self.allocator);
     }
+
+    fn h2Stream(self: *StreamHandle) ?*h2_stream.Stream {
+        return self.client.conn.streams.get(self.handle.stream_id);
+    }
 };
+
+/// Reset a stream that is not closed yet, and mark it closed here.
+fn resetStream(client: *h2_client.Client, stream_id: u31) void {
+    const s = client.conn.streams.get(stream_id) orelse return;
+    if (s.isClosed()) return;
+    client.conn.sendRstStream(stream_id, .cancel) catch {};
+    s.sendReset(.cancel);
+}
 
 fn parseGrpcStatus(headers: []const h2_hpack.HeaderField) grpc_status.Status {
     var code: grpc_status.Code = .ok;
