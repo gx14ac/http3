@@ -286,6 +286,17 @@ pub const StreamMap = struct {
     }
 
     pub fn openStream(self: *StreamMap, initial_send_window: u32, initial_recv_window: u32) Error!*Stream {
+        // A closed stream holds its slot, its index entry and its place in
+        // `count` until it is swept. Nothing else sweeps, so without this a
+        // connection could open only max_concurrent streams in its whole
+        // life — a client polling one RPC over a long-lived connection hit
+        // MaxConcurrentStreams after a hundred calls, all of them finished.
+        // Swept when room is short rather than on every open: the index
+        // fills one entry per stream ever opened, and the count only
+        // counts down here.
+        if (self.count >= self.max_concurrent or self.count >= max_streams or self.id_count >= max_streams) {
+            self.removeClosedStreams();
+        }
         if (self.count >= self.max_concurrent) return Error.MaxConcurrentStreams;
         if (self.count >= max_streams) return Error.MaxConcurrentStreams;
 
@@ -494,6 +505,34 @@ test "StreamMap removeClosedStreams" {
 
     sm.removeClosedStreams();
     try std.testing.expectEqual(@as(u32, 0), sm.activeCount());
+}
+
+test "StreamMap: streams that finished free their slots for new ones" {
+    // More streams over the life of one map than max_concurrent, and more
+    // than the map has slots, each finished before the next opens: a unary
+    // call repeated on one connection.
+    var sm = StreamMap.init(100);
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        const s = try sm.openStream(65535, 65535);
+        try s.sendHeaders(true);
+        try s.recvHeaders(true);
+        try std.testing.expect(s.isClosed());
+        // And the stream just opened can be found by its ID.
+        try std.testing.expect(sm.get(s.id) != null);
+    }
+    try std.testing.expect(sm.activeCount() <= 100);
+}
+
+test "StreamMap: streams still open are not swept, and still count" {
+    var sm = StreamMap.init(3);
+    _ = try sm.openStream(65535, 65535);
+    _ = try sm.openStream(65535, 65535);
+    const done = try sm.openStream(65535, 65535);
+    done.sendReset(.cancel);
+    // One closed: room for one more, and no more than that.
+    _ = try sm.openStream(65535, 65535);
+    try std.testing.expectError(StreamMap.Error.MaxConcurrentStreams, sm.openStream(65535, 65535));
 }
 
 test "StreamMap stream IDs are odd and incrementing" {
