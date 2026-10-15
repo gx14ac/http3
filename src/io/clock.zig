@@ -17,6 +17,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
+const is_freestanding = builtin.os.tag == .freestanding;
+
+/// A freestanding build (a microcontroller) has no libc clock of its own
+/// to call; the firmware it is linked into supplies these two.
+const embedder = if (!is_freestanding) struct {} else struct {
+    extern fn http3_monotonic_ns() u64;
+    extern fn http3_sleep_ns(ns: u64) void;
+};
 
 /// Declared here because `std.os.windows.kernel32` does not declare them.
 const kernel32 = if (!is_windows) struct {} else struct {
@@ -48,6 +56,7 @@ fn performanceFrequency() i64 {
 /// step is about 15ms — coarse enough to read a request on a local network
 /// as having taken no time at all.
 pub fn monotonicNs() i128 {
+    if (comptime is_freestanding) return embedder.http3_monotonic_ns();
     if (comptime is_windows) {
         var count: i64 = 0;
         _ = kernel32.QueryPerformanceCounter(&count);
@@ -105,6 +114,7 @@ fn msFromNs(ns: u64) u32 {
 /// because retrying it would spin. Windows' Sleep is not interruptible and
 /// counts whole milliseconds, so a wait there is rounded up to one.
 pub fn sleepNs(ns: u64) void {
+    if (comptime is_freestanding) return embedder.http3_sleep_ns(ns);
     if (comptime is_windows) {
         kernel32.Sleep(msFromNs(ns));
         return;
