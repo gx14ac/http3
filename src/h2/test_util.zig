@@ -15,7 +15,7 @@ pub const TestPipe = struct {
         return .{
             .read_buf = input,
             .read_pos = 0,
-            .write_buf = .{},
+            .write_buf = .empty,
             .allocator = allocator,
         };
     }

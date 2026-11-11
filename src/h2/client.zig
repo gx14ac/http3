@@ -626,7 +626,7 @@ const TestPipe = struct {
         return .{
             .read_buf = input,
             .read_pos = 0,
-            .write_buf = .{},
+            .write_buf = .empty,
             .allocator = allocator,
         };
     }
@@ -714,7 +714,7 @@ fn buildDataFrame(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8)
 test "client handshake" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
     try buildServerPreface(allocator, &server_data);
 
@@ -729,7 +729,7 @@ test "client handshake" {
 test "client GET request with response" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     // Server preface
@@ -760,7 +760,7 @@ test "client GET request with response" {
 test "client POST request with body" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -787,7 +787,7 @@ test "client POST request with body" {
 test "client multiple streams (multiplexed)" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -822,7 +822,7 @@ test "client multiple streams (multiplexed)" {
 test "client recvResponse reassembles CONTINUATION frames" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -880,7 +880,7 @@ test "client recvResponse reassembles CONTINUATION frames" {
 test "client request on closed connection fails" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     var pipe = TestPipe.init(allocator, server_data.items);
@@ -895,7 +895,7 @@ test "client request on closed connection fails" {
 test "client sends stream WINDOW_UPDATE for large response" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -949,7 +949,7 @@ test "client sends stream WINDOW_UPDATE for large response" {
 test "client handles out-of-order responses (demux)" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -986,7 +986,7 @@ test "client handles out-of-order responses (demux)" {
 test "client handles out-of-order data frames (demux)" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -1025,7 +1025,7 @@ test "client handles out-of-order data frames (demux)" {
 test "client handles interleaved frames from multiple streams (demux)" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);

@@ -552,7 +552,7 @@ const appendSettingsAck = test_util.appendSettingsAck;
 test "client preface + settings exchange" {
     const allocator = std.testing.allocator;
 
-    var server_input = std.ArrayListUnmanaged(u8){};
+    var server_input = std.ArrayListUnmanaged(u8).empty;
     defer server_input.deinit(allocator);
 
     // Server sends: SETTINGS (empty) + SETTINGS ACK
@@ -587,7 +587,7 @@ test "ping roundtrip" {
     const allocator = std.testing.allocator;
 
     // Server sends a PING
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
     const ping_data = [8]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
     var ping_buf: [17]u8 = undefined;
@@ -620,7 +620,7 @@ test "ping roundtrip" {
 test "goaway received" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // Build GOAWAY: last_stream_id=5, error=no_error
@@ -644,7 +644,7 @@ test "goaway received" {
 test "window update on connection" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // WINDOW_UPDATE on stream 0, increment=32768
@@ -668,7 +668,7 @@ test "window update on connection" {
 test "rst_stream received" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     var rst_buf: [13]u8 = undefined;
@@ -690,7 +690,7 @@ test "rst_stream received" {
 test "data frame updates connection flow control" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // DATA frame: stream 1, 100 bytes, no end_stream
