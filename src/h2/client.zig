@@ -191,11 +191,6 @@ pub const Client = struct {
         if (has_body) {
             const data = body.?;
             self.conn.sendData(stream_id, data, opts.end_stream) catch |e| return mapConnError(e);
-            stream.sendData(@intCast(data.len), opts.end_stream) catch |e| return switch (e) {
-                error.StreamClosed => ClientError.ProtocolError,
-                error.FlowControlError => ClientError.FlowControlError,
-                error.ProtocolError => ClientError.ProtocolError,
-            };
         }
 
         return RequestHandle{ .stream_id = stream_id };
@@ -389,16 +384,12 @@ pub const Client = struct {
     }
 
     /// Send DATA on an existing stream. Used by gRPC streaming layer.
+    /// FlowControlError when the connection's or the stream's send window
+    /// is short of `data.len`; nothing is sent then, and the stream is as
+    /// it was. The peer's WINDOW_UPDATEs, taken in by whatever reads frames
+    /// (recvResponse, recvEvent), make room.
     pub fn sendStreamData(self: *Client, handle: RequestHandle, data: []const u8, end_stream: bool) ClientError!void {
         self.conn.sendData(handle.stream_id, data, end_stream) catch |e| return mapConnError(e);
-        const stream = self.conn.streams.get(handle.stream_id);
-        if (stream) |s| {
-            s.sendData(@intCast(data.len), end_stream) catch |e| return switch (e) {
-                error.StreamClosed => ClientError.ProtocolError,
-                error.FlowControlError => ClientError.FlowControlError,
-                error.ProtocolError => ClientError.ProtocolError,
-            };
-        }
     }
 
     /// Receive a single frame event. Used by gRPC streaming layer for frame-by-frame reading.
@@ -626,7 +617,7 @@ const TestPipe = struct {
         return .{
             .read_buf = input,
             .read_pos = 0,
-            .write_buf = .{},
+            .write_buf = .empty,
             .allocator = allocator,
         };
     }
@@ -714,7 +705,7 @@ fn buildDataFrame(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8)
 test "client handshake" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
     try buildServerPreface(allocator, &server_data);
 
@@ -729,7 +720,7 @@ test "client handshake" {
 test "client GET request with response" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     // Server preface
@@ -760,7 +751,7 @@ test "client GET request with response" {
 test "client POST request with body" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -787,7 +778,7 @@ test "client POST request with body" {
 test "client multiple streams (multiplexed)" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -822,7 +813,7 @@ test "client multiple streams (multiplexed)" {
 test "client recvResponse reassembles CONTINUATION frames" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -880,7 +871,7 @@ test "client recvResponse reassembles CONTINUATION frames" {
 test "client request on closed connection fails" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     var pipe = TestPipe.init(allocator, server_data.items);
@@ -895,7 +886,7 @@ test "client request on closed connection fails" {
 test "client sends stream WINDOW_UPDATE for large response" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -949,7 +940,7 @@ test "client sends stream WINDOW_UPDATE for large response" {
 test "client handles out-of-order responses (demux)" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -986,7 +977,7 @@ test "client handles out-of-order responses (demux)" {
 test "client handles out-of-order data frames (demux)" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -1025,7 +1016,7 @@ test "client handles out-of-order data frames (demux)" {
 test "client handles interleaved frames from multiple streams (demux)" {
     const allocator = std.testing.allocator;
 
-    var server_data = std.ArrayListUnmanaged(u8){};
+    var server_data = std.ArrayListUnmanaged(u8).empty;
     defer server_data.deinit(allocator);
 
     try buildServerPreface(allocator, &server_data);
@@ -1059,4 +1050,113 @@ test "client handles interleaved frames from multiple streams (demux)" {
     const resp2 = try client.recvResponse(h2, &headers, &decode_buf, &body_buf);
     try std.testing.expectEqual(@as(u16, 201), resp2.status);
     try std.testing.expectEqualStrings("three", resp2.body);
+}
+
+fn buildWindowUpdateFrame(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), stream_id: u31, increment: u31) !void {
+    var frame_buf: [13]u8 = undefined;
+    _ = try frame.buildWindowUpdate(stream_id, increment, &frame_buf);
+    try buf.appendSlice(allocator, &frame_buf);
+}
+
+/// DATA bytes the client wrote on `stream_id`, past the connection preface.
+fn dataSent(out: []const u8, stream_id: u31) usize {
+    var total: usize = 0;
+    var pos: usize = frame.client_preface.len;
+    while (pos + 9 <= out.len) {
+        const hdr = frame.FrameHeader.decode(out[pos..][0..9]);
+        if (hdr.frame_type == .data and hdr.stream_id == stream_id) total += hdr.length;
+        pos += 9 + @as(usize, hdr.length);
+    }
+    return total;
+}
+
+test "client takes in a stream WINDOW_UPDATE while waiting for a response" {
+    const allocator = std.testing.allocator;
+
+    var server_data = std.ArrayListUnmanaged(u8).empty;
+    defer server_data.deinit(allocator);
+    try buildServerPreface(allocator, &server_data);
+    try buildWindowUpdateFrame(allocator, &server_data, 0, 1 << 20);
+    try buildWindowUpdateFrame(allocator, &server_data, 1, 1000);
+    try buildResponseHeaders(allocator, &server_data, 1, "200", true);
+
+    var pipe = TestPipe.init(allocator, server_data.items);
+    defer pipe.deinit();
+    var client = Client.init(allocator, pipe.reader(), pipe.writer(), .{});
+    defer client.deinit();
+    try client.handshake();
+
+    const handle = try client.request(.POST, "/up", "example.com", null, .{ .end_stream = false });
+    var headers: [16]hpack.HeaderField = undefined;
+    var decode_buf: [4096]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    const resp = try client.recvResponse(handle, &headers, &decode_buf, &body_buf);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    const stream = client.conn.streams.get(handle.stream_id).?;
+    try std.testing.expectEqual(@as(u32, 65535 + 1000), stream.send_window.available());
+
+    // More than the initial stream window goes out, and then no more.
+    const chunk = [_]u8{'u'} ** 16384;
+    var sent: usize = 0;
+    while (sent < 65535 + 1000) {
+        const n = @min(chunk.len, 65535 + 1000 - sent);
+        try client.sendStreamData(handle, chunk[0..n], false);
+        sent += n;
+    }
+    try std.testing.expectError(ClientError.FlowControlError, client.sendStreamData(handle, "x", false));
+    try std.testing.expectEqual(@as(usize, 65535 + 1000), dataSent(pipe.written(), handle.stream_id));
+}
+
+test "client sends window after window on one stream as the peer tops it up" {
+    const allocator = std.testing.allocator;
+    const rounds = 3;
+
+    // The peer, after each window the client fills, tops up both the
+    // connection and the stream, as a server reading a long upload does.
+    var server_data = std.ArrayListUnmanaged(u8).empty;
+    defer server_data.deinit(allocator);
+    try buildServerPreface(allocator, &server_data);
+    for (1..rounds) |_| {
+        try buildWindowUpdateFrame(allocator, &server_data, 0, 65535);
+        try buildWindowUpdateFrame(allocator, &server_data, 1, 65535);
+    }
+
+    var pipe = TestPipe.init(allocator, server_data.items);
+    defer pipe.deinit();
+    var client = Client.init(allocator, pipe.reader(), pipe.writer(), .{});
+    defer client.deinit();
+    try client.handshake();
+
+    const handle = try client.request(.POST, "/up", "example.com", null, .{ .end_stream = false });
+    const stream = client.conn.streams.get(handle.stream_id).?;
+    const chunk = [_]u8{'u'} ** 16384;
+
+    for (0..rounds) |round| {
+        if (round > 0) {
+            // The frame reading the gRPC layer does (StreamHandle.recv).
+            for (0..2) |_| {
+                const event = try client.recvEvent();
+                try std.testing.expect(event == .window_update);
+            }
+        }
+        var sent: usize = 0;
+        while (sent < 65535) {
+            const n = @min(chunk.len, 65535 - sent);
+            try client.sendStreamData(handle, chunk[0..n], false);
+            sent += n;
+        }
+        // Both windows are spent: a send is refused, with END_STREAM too,
+        // and leaves the stream as it was.
+        const before = pipe.written().len;
+        try std.testing.expectError(ClientError.FlowControlError, client.sendStreamData(handle, "x", false));
+        try std.testing.expectError(ClientError.FlowControlError, client.sendStreamData(handle, "x", true));
+        try std.testing.expectEqual(before, pipe.written().len);
+        try std.testing.expectEqual(stream_mod.State.open, stream.state);
+    }
+    try std.testing.expectEqual(@as(usize, rounds * 65535), dataSent(pipe.written(), handle.stream_id));
+
+    // Ending the stream needs no room.
+    try client.sendStreamData(handle, &.{}, true);
+    try std.testing.expectEqual(stream_mod.State.half_closed_local, stream.state);
 }

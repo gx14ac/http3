@@ -30,7 +30,7 @@ fn initConn(pipe: *TestPipe) Connection {
 test "§4.2: frame exceeding max_frame_size → FRAME_SIZE_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // DATA frame with length > default max_frame_size (16384)
@@ -59,7 +59,7 @@ test "§4.2: frame exceeding max_frame_size → FRAME_SIZE_ERROR" {
 test "§5.1: DATA on stream 0 → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -86,7 +86,7 @@ test "§5.1: DATA on stream 0 → PROTOCOL_ERROR" {
 test "§6.5: SETTINGS ACK with non-zero payload → FRAME_SIZE_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // SETTINGS with ACK flag but 6 bytes payload
@@ -113,7 +113,7 @@ test "§6.5: SETTINGS ACK with non-zero payload → FRAME_SIZE_ERROR" {
 test "§6.5: SETTINGS with odd payload length → FRAME_SIZE_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // SETTINGS with 7 bytes (not multiple of 6)
@@ -139,7 +139,7 @@ test "§6.5: SETTINGS with odd payload length → FRAME_SIZE_ERROR" {
 test "§6.5: SETTINGS on non-zero stream → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -163,7 +163,7 @@ test "§6.5: SETTINGS on non-zero stream → PROTOCOL_ERROR" {
 test "§6.5: unsolicited SETTINGS ACK → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // ACK without pending_settings_ack = true
@@ -190,7 +190,7 @@ test "§6.5: unsolicited SETTINGS ACK → PROTOCOL_ERROR" {
 test "§6.7: PING with length != 8 → FRAME_SIZE_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -215,7 +215,7 @@ test "§6.7: PING with length != 8 → FRAME_SIZE_ERROR" {
 test "§6.7: PING on non-zero stream → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -242,7 +242,7 @@ test "§6.7: PING on non-zero stream → PROTOCOL_ERROR" {
 test "§6.8: GOAWAY on non-zero stream → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -267,7 +267,7 @@ test "§6.8: GOAWAY on non-zero stream → PROTOCOL_ERROR" {
 test "§6.8: GOAWAY with length < 8 → FRAME_SIZE_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -292,7 +292,7 @@ test "§6.8: GOAWAY with length < 8 → FRAME_SIZE_ERROR" {
 test "§6.8: GOAWAY transitions to goaway_received state" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     var goaway_buf: [64]u8 = undefined;
@@ -312,7 +312,7 @@ test "§6.8: GOAWAY transitions to goaway_received state" {
 test "§6.8: after GOAWAY, existing stream frames still processable" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // GOAWAY with last_stream_id=5, then a WINDOW_UPDATE on stream 0
@@ -343,7 +343,7 @@ test "§6.8: after GOAWAY, existing stream frames still processable" {
 test "§6.9: WINDOW_UPDATE with increment=0 → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // WINDOW_UPDATE on stream 0 with increment=0
@@ -371,7 +371,7 @@ test "§6.9: WINDOW_UPDATE with increment=0 → PROTOCOL_ERROR" {
 test "§6.9: WINDOW_UPDATE with wrong length → FRAME_SIZE_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -396,7 +396,7 @@ test "§6.9: WINDOW_UPDATE with wrong length → FRAME_SIZE_ERROR" {
 test "§6.9: WINDOW_UPDATE overflow → FLOW_CONTROL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // Send max increment on already-max window
@@ -426,7 +426,7 @@ test "§6.9: WINDOW_UPDATE overflow → FLOW_CONTROL_ERROR" {
 test "§6.4: RST_STREAM on stream 0 → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -451,7 +451,7 @@ test "§6.4: RST_STREAM on stream 0 → PROTOCOL_ERROR" {
 test "§6.4: RST_STREAM with wrong length → FRAME_SIZE_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -478,7 +478,7 @@ test "§6.4: RST_STREAM with wrong length → FRAME_SIZE_ERROR" {
 test "§4.1: unknown frame type → skip and continue" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // Unknown frame type 0xFF with 3 bytes payload
@@ -513,7 +513,7 @@ test "§4.1: unknown frame type → skip and continue" {
 test "§6.5.2: SETTINGS initial_window_size > 2^31-1 → FLOW_CONTROL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // SETTINGS with initial_window_size = 0x80000000 (exceeds max)
@@ -559,7 +559,7 @@ test "§5.1: recvFrame on closed connection → CONNECTION_CLOSED" {
 test "PING flood: multiple consecutive PINGs handled without stack overflow" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // Send 100 PINGs followed by a PING ACK
@@ -594,7 +594,7 @@ test "PING flood: multiple consecutive PINGs handled without stack overflow" {
 test "§6.5.3: SETTINGS enable_push != 0 or 1 → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -625,7 +625,7 @@ test "§6.5.3: SETTINGS enable_push != 0 or 1 → PROTOCOL_ERROR" {
 test "§6.10: HEADERS without END_HEADERS followed by CONTINUATION" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // HEADERS on stream 1, no END_HEADERS, 0 bytes payload (fragment split across CONTINUATION)
@@ -671,7 +671,7 @@ test "§6.10: HEADERS without END_HEADERS followed by CONTINUATION" {
 test "§6.10: non-CONTINUATION frame during continuation state → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // HEADERS on stream 1, no END_HEADERS
@@ -712,7 +712,7 @@ test "§6.10: non-CONTINUATION frame during continuation state → PROTOCOL_ERRO
 test "§6.10: CONTINUATION on wrong stream → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // HEADERS on stream 1, no END_HEADERS
@@ -751,7 +751,7 @@ test "§6.10: CONTINUATION on wrong stream → PROTOCOL_ERROR" {
 test "§6.10: CONTINUATION without preceding HEADERS → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // CONTINUATION frame with no prior HEADERS
@@ -777,7 +777,7 @@ test "§6.10: CONTINUATION without preceding HEADERS → PROTOCOL_ERROR" {
 test "§6.10: multiple CONTINUATION frames until END_HEADERS" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // HEADERS on stream 1, no END_HEADERS, 0 bytes (payload in CONTINUATION)
@@ -964,7 +964,7 @@ test "§8.1: response missing :status → error" {
 test "DoS: PING flood triggers protocol error at threshold" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // Send 12 PINGs (threshold is 10 by default)
@@ -986,7 +986,7 @@ test "DoS: PING flood triggers protocol error at threshold" {
 test "DoS: PING counter resets after DATA received" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // 9 PINGs (under threshold)
@@ -1037,7 +1037,7 @@ test "DoS: PING counter resets after DATA received" {
 test "DoS: SETTINGS flood triggers protocol error" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // Send 22 SETTINGS frames (threshold is 20 by default)
@@ -1067,7 +1067,7 @@ test "DoS: SETTINGS flood triggers protocol error" {
 test "DoS: resetDoSCounters allows more settings" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // 40 empty SETTINGS + final PING ACK
@@ -1112,7 +1112,7 @@ test "DoS: resetDoSCounters allows more settings" {
 test "DoS: empty DATA frames trigger protocol error" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // Use a small threshold for the test
@@ -1176,7 +1176,7 @@ test "connection replaceTransport resets state" {
 test "§3.4: server preface must be SETTINGS (not PING) → INVALID_PREFACE" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // Server sends PING instead of SETTINGS as first frame
@@ -1196,7 +1196,7 @@ test "§3.4: server preface must be SETTINGS (not PING) → INVALID_PREFACE" {
 test "§3.4: server preface SETTINGS with ACK flag → INVALID_PREFACE" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // SETTINGS ACK as first frame (invalid — first SETTINGS must not be ACK)
@@ -1216,7 +1216,7 @@ test "§3.4: server preface SETTINGS with ACK flag → INVALID_PREFACE" {
 test "§3.4: server preface SETTINGS on non-zero stream → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // SETTINGS on stream 1 (must be stream 0)
@@ -1242,7 +1242,7 @@ test "§3.4: server preface SETTINGS on non-zero stream → PROTOCOL_ERROR" {
 test "§3.4: valid server preface transitions to waiting_settings_ack" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // Valid empty SETTINGS on stream 0
@@ -1276,7 +1276,7 @@ test "§3.4: valid server preface transitions to waiting_settings_ack" {
 test "§6.5.2: SETTINGS max_frame_size < 16384 → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -1305,7 +1305,7 @@ test "§6.5.2: SETTINGS max_frame_size < 16384 → PROTOCOL_ERROR" {
 test "§6.5.2: SETTINGS max_frame_size > 16777215 → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -1334,7 +1334,7 @@ test "§6.5.2: SETTINGS max_frame_size > 16777215 → PROTOCOL_ERROR" {
 test "§6.5.2: SETTINGS max_frame_size = 16384 (minimum valid) → accepted" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -1364,7 +1364,7 @@ test "§6.5.2: SETTINGS max_frame_size = 16384 (minimum valid) → accepted" {
 test "§6.5.2: SETTINGS max_frame_size = 16777215 (maximum valid) → accepted" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -1396,7 +1396,7 @@ test "§6.5.2: SETTINGS max_frame_size = 16777215 (maximum valid) → accepted" 
 test "§6.5.2: unknown SETTINGS parameter → ignored (no error)" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -1427,7 +1427,7 @@ test "§6.5.2: unknown SETTINGS parameter → ignored (no error)" {
 test "§6.5: SETTINGS with multiple valid parameters → all applied" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -1471,7 +1471,7 @@ test "§6.5: SETTINGS with multiple valid parameters → all applied" {
 test "§8.2: PUSH_PROMISE frame → skipped as unknown (client rejects push)" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // PUSH_PROMISE frame (type=5): 4-byte promised stream ID + header block
@@ -1507,7 +1507,7 @@ test "§8.2: PUSH_PROMISE frame → skipped as unknown (client rejects push)" {
 test "§5.1: HEADERS on stream 0 → PROTOCOL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -1533,7 +1533,7 @@ test "§5.1: HEADERS on stream 0 → PROTOCOL_ERROR" {
 test "§6.9.1: DATA exceeding connection flow control window → FLOW_CONTROL_ERROR" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // DATA frame with length > default initial window size (65535)
@@ -1563,7 +1563,7 @@ test "§6.9.1: DATA exceeding connection flow control window → FLOW_CONTROL_ER
 test "§6.9.2: SETTINGS initial_window_size change applies to existing streams" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // SETTINGS with initial_window_size = 32768 (half of default 65535)
@@ -1598,7 +1598,7 @@ test "§6.9.2: SETTINGS initial_window_size change applies to existing streams" 
 test "§6.1: DATA frame larger than max_frame_size is rejected even with PADDED flag" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // DATA frame with PADDED flag, but total length exceeds max_frame_size
@@ -1625,7 +1625,7 @@ test "§6.1: DATA frame larger than max_frame_size is rejected even with PADDED 
 test "§6.2: HEADERS frame exceeding max_frame_size rejected regardless of PRIORITY flag" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // HEADERS frame with PRIORITY flag, but total length exceeds max_frame_size
@@ -1652,7 +1652,7 @@ test "§6.2: HEADERS frame exceeding max_frame_size rejected regardless of PRIOR
 test "§4.2: large SETTINGS frame not rejected by max_frame_size" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // SETTINGS frame with 10 params (60 bytes payload, exceeds max_frame_size=16384? No,
@@ -1692,7 +1692,7 @@ test "§4.2: large SETTINGS frame not rejected by max_frame_size" {
 test "§6.9: WINDOW_UPDATE on non-zero stream → returns event with stream_id" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -1723,7 +1723,7 @@ test "§6.9: WINDOW_UPDATE on non-zero stream → returns event with stream_id" 
 test "§6.4: RST_STREAM carries correct error code" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const fh = frame.FrameHeader{
@@ -1754,7 +1754,7 @@ test "§6.4: RST_STREAM carries correct error code" {
 test "§6.8: GOAWAY with debug data is accepted and debug data skipped" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // GOAWAY: last_stream_id=7, error_code=enhance_your_calm, debug="too fast"
@@ -1791,7 +1791,7 @@ test "§6.8: GOAWAY with debug data is accepted and debug data skipped" {
 test "§4.1: PRIORITY frame → skipped as deprecated" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // PRIORITY frame (type=2, 5 bytes payload)
@@ -1826,7 +1826,7 @@ test "§4.1: PRIORITY frame → skipped as deprecated" {
 test "§6.7: PING sends ACK with identical opaque data" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     const ping_data = [8]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
@@ -2037,7 +2037,7 @@ test "§8.1.2: :status '999' is valid (extension status)" {
 test "pending_payload: unconsumed DATA payload is auto-skipped on next recvFrame" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // DATA frame with 5 bytes payload on stream 1
@@ -2077,7 +2077,7 @@ test "pending_payload: unconsumed DATA payload is auto-skipped on next recvFrame
 test "pending_payload: payloadConsumed prevents auto-skip" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // DATA frame with 5 bytes payload on stream 1
@@ -2124,7 +2124,7 @@ test "pending_payload: payloadConsumed prevents auto-skip" {
 test "pending_payload: HEADERS payload auto-skip works" {
     const allocator = std.testing.allocator;
 
-    var input = std.ArrayListUnmanaged(u8){};
+    var input = std.ArrayListUnmanaged(u8).empty;
     defer input.deinit(allocator);
 
     // HEADERS frame with 3 bytes payload on stream 1
