@@ -31,6 +31,9 @@ pub const Event = union(enum) {
     window_update: struct { stream_id: u31, increment: u31 },
     headers: struct { stream_id: u31, end_stream: bool, payload_len: u24 },
     data: struct { stream_id: u31, end_stream: bool, payload_len: u24 },
+    /// A stream reset: by the peer, or by this side for a stream error
+    /// found while reading (a WINDOW_UPDATE that takes the stream's send
+    /// window past 2^31-1), in which case the RST_STREAM has been sent.
     rst_stream: struct { stream_id: u31, error_code: frame.ErrorCode },
     continuation: struct { stream_id: u31, end_headers: bool, payload_len: u24 },
 };
@@ -261,10 +264,16 @@ pub const Connection = struct {
         self.writeAll(header_block) catch return ConnectionError.IoError;
     }
 
-    /// Send a DATA frame. Caller is responsible for flow control checks.
+    /// Send a DATA frame on an open stream, within flow control: both the
+    /// connection's and the stream's send windows must have room for all
+    /// of `data`. When either is short (FlowControlError) or the stream
+    /// cannot send (ProtocolError), nothing is written and nothing changes:
+    /// neither window, nor the stream's state, so a refused END_STREAM
+    /// leaves the stream open. Room comes back as recvFrame takes in the
+    /// peer's WINDOW_UPDATEs.
     pub fn sendData(self: *Connection, stream_id: u31, data: []const u8, end_stream: bool) ConnectionError!void {
-        self.flow_control.consumeSend(@intCast(data.len)) catch
-            return ConnectionError.FlowControlError;
+        const stream = self.streams.get(stream_id) orelse return ConnectionError.ProtocolError;
+        const len: u32 = @intCast(data.len);
 
         const flags: frame.Flags = if (end_stream) frame.Flags.END_STREAM else .{};
         const fh = frame.FrameHeader{
@@ -275,8 +284,19 @@ pub const Connection = struct {
         };
         var buf: [9]u8 = undefined;
         fh.encode(&buf);
+
+        // Only senders, under write_mu, take from the connection window; the
+        // reader only adds to it. The room checked here is there below.
         self.write_mu.lock();
         defer self.write_mu.unlock();
+        if (len > self.flow_control.availableSend()) return ConnectionError.FlowControlError;
+        // Checks the stream's state and window before it changes either.
+        stream.sendData(len, end_stream) catch |e| return switch (e) {
+            error.FlowControlError => ConnectionError.FlowControlError,
+            error.StreamClosed, error.ProtocolError => ConnectionError.ProtocolError,
+        };
+        self.flow_control.consumeSend(len) catch unreachable;
+
         self.writeAll(&buf) catch return ConnectionError.IoError;
         if (data.len > 0) {
             self.writeAll(data) catch return ConnectionError.IoError;
@@ -457,6 +477,24 @@ pub const Connection = struct {
         if (header.stream_id == 0) {
             self.flow_control.creditSend(increment) catch
                 return ConnectionError.FlowControlError;
+        } else if (self.streams.get(header.stream_id)) |stream| {
+            stream.recvWindowUpdate(increment) catch |e| switch (e) {
+                // RFC 9113 §6.9: the peer may still send one after the
+                // stream has closed here. One for a stream that has also
+                // left the map is passed over the same way.
+                error.StreamClosed => {},
+                error.ProtocolError => return ConnectionError.ProtocolError,
+                // §6.9.1: past 2^31-1 on a stream is a stream error.
+                error.FlowControlError => {
+                    stream.sendReset(.flow_control_error);
+                    self.sendRstStream(header.stream_id, .flow_control_error) catch
+                        return ConnectionError.IoError;
+                    return Event{ .rst_stream = .{
+                        .stream_id = header.stream_id,
+                        .error_code = .flow_control_error,
+                    } };
+                },
+            };
         }
         return Event{ .window_update = .{
             .stream_id = header.stream_id,
@@ -746,17 +784,180 @@ test "sendData writes correct frame and consumes window" {
 
     var conn = Connection.init(pipe.reader(), pipe.writer(), .{});
     conn.state = .open;
+    const stream = try conn.streams.openStream(65535, 65535);
+    try stream.sendHeaders(false);
 
     const payload = "hello world";
-    try conn.sendData(3, payload, false);
+    try conn.sendData(stream.id, payload, false);
 
     const out = pipe.written();
     const hdr = frame.FrameHeader.decode(out[0..9]);
     try std.testing.expectEqual(frame.FrameType.data, hdr.frame_type);
-    try std.testing.expectEqual(@as(u31, 3), hdr.stream_id);
+    try std.testing.expectEqual(stream.id, hdr.stream_id);
     try std.testing.expect(!hdr.flags.hasEndStream());
     try std.testing.expectEqualStrings(payload, out[9..]);
     try std.testing.expectEqual(@as(u32, 65535 - 11), conn.flow_control.availableSend());
+    try std.testing.expectEqual(@as(u32, 65535 - 11), stream.send_window.available());
+}
+
+test "sendData short of the stream window changes nothing, END_STREAM or not" {
+    const allocator = std.testing.allocator;
+    var pipe = TestPipe.init(allocator, &.{});
+    defer pipe.deinit();
+
+    var conn = Connection.init(pipe.reader(), pipe.writer(), .{});
+    conn.state = .open;
+    // The connection has room for 200 bytes; the stream only for 100.
+    const stream = try conn.streams.openStream(100, 65535);
+    try stream.sendHeaders(false);
+
+    const payload = [_]u8{'x'} ** 200;
+    for ([_]bool{ false, true }) |end_stream| {
+        try std.testing.expectError(ConnectionError.FlowControlError, conn.sendData(stream.id, &payload, end_stream));
+        try std.testing.expectEqual(@as(u32, 65535), conn.flow_control.availableSend());
+        try std.testing.expectEqual(@as(u32, 100), stream.send_window.available());
+        try std.testing.expectEqual(stream_mod.State.open, stream.state);
+        try std.testing.expectEqual(@as(usize, 0), pipe.written().len);
+    }
+
+    // The stream is still open and sends what fits, then ends.
+    try conn.sendData(stream.id, payload[0..100], true);
+    try std.testing.expectEqual(stream_mod.State.half_closed_local, stream.state);
+    try std.testing.expectEqual(@as(u32, 0), stream.send_window.available());
+    try std.testing.expectEqual(@as(u32, 65535 - 100), conn.flow_control.availableSend());
+}
+
+test "sendData short of the connection window changes nothing, END_STREAM or not" {
+    const allocator = std.testing.allocator;
+    var pipe = TestPipe.init(allocator, &.{});
+    defer pipe.deinit();
+
+    var conn = Connection.init(pipe.reader(), pipe.writer(), .{});
+    conn.state = .open;
+    // The stream has room for 200 bytes; the connection only for 10.
+    const stream = try conn.streams.openStream(65535, 65535);
+    try stream.sendHeaders(false);
+    try conn.flow_control.consumeSend(65535 - 10);
+
+    const payload = [_]u8{'x'} ** 200;
+    for ([_]bool{ false, true }) |end_stream| {
+        try std.testing.expectError(ConnectionError.FlowControlError, conn.sendData(stream.id, &payload, end_stream));
+        try std.testing.expectEqual(@as(u32, 10), conn.flow_control.availableSend());
+        try std.testing.expectEqual(@as(u32, 65535), stream.send_window.available());
+        try std.testing.expectEqual(stream_mod.State.open, stream.state);
+        try std.testing.expectEqual(@as(usize, 0), pipe.written().len);
+    }
+}
+
+test "sendData on a stream that cannot send changes nothing" {
+    const allocator = std.testing.allocator;
+    var pipe = TestPipe.init(allocator, &.{});
+    defer pipe.deinit();
+
+    var conn = Connection.init(pipe.reader(), pipe.writer(), .{});
+    conn.state = .open;
+    const stream = try conn.streams.openStream(65535, 65535);
+    try stream.sendHeaders(true); // half-closed (local): no more DATA
+
+    try std.testing.expectError(ConnectionError.ProtocolError, conn.sendData(stream.id, "late", false));
+    // Never opened here.
+    try std.testing.expectError(ConnectionError.ProtocolError, conn.sendData(99, "stray", false));
+    try std.testing.expectEqual(@as(u32, 65535), conn.flow_control.availableSend());
+    try std.testing.expectEqual(@as(u32, 65535), stream.send_window.available());
+    try std.testing.expectEqual(stream_mod.State.half_closed_local, stream.state);
+    try std.testing.expectEqual(@as(usize, 0), pipe.written().len);
+}
+
+test "stream WINDOW_UPDATE grows that stream's send window and no other" {
+    const allocator = std.testing.allocator;
+
+    var input = std.ArrayListUnmanaged(u8).empty;
+    defer input.deinit(allocator);
+    var wu_buf: [13]u8 = undefined;
+    _ = try frame.buildWindowUpdate(3, 1000, &wu_buf);
+    try input.appendSlice(allocator, &wu_buf);
+
+    var pipe = TestPipe.init(allocator, input.items);
+    defer pipe.deinit();
+    var conn = Connection.init(pipe.reader(), pipe.writer(), .{});
+    conn.state = .open;
+    const s1 = try conn.streams.openStream(65535, 65535);
+    try s1.sendHeaders(false);
+    const s3 = try conn.streams.openStream(65535, 65535);
+    try s3.sendHeaders(false);
+    try std.testing.expectEqual(@as(u31, 3), s3.id);
+
+    const event = try conn.recvFrame();
+    try std.testing.expect(event == .window_update);
+    try std.testing.expectEqual(@as(u32, 65535 + 1000), s3.send_window.available());
+    try std.testing.expectEqual(@as(u32, 65535), s1.send_window.available());
+    try std.testing.expectEqual(@as(u32, 65535), conn.flow_control.availableSend());
+}
+
+test "stream WINDOW_UPDATE past 2^31-1 resets that stream, not the connection" {
+    const allocator = std.testing.allocator;
+
+    var input = std.ArrayListUnmanaged(u8).empty;
+    defer input.deinit(allocator);
+    var wu_buf: [13]u8 = undefined;
+    // 65535 + 0x7FFFFFFF overflows the stream's window.
+    _ = try frame.buildWindowUpdate(1, 0x7FFFFFFF, &wu_buf);
+    try input.appendSlice(allocator, &wu_buf);
+    // The connection carries on: the next frame is read as usual.
+    _ = try frame.buildWindowUpdate(0, 1000, &wu_buf);
+    try input.appendSlice(allocator, &wu_buf);
+
+    var pipe = TestPipe.init(allocator, input.items);
+    defer pipe.deinit();
+    var conn = Connection.init(pipe.reader(), pipe.writer(), .{});
+    conn.state = .open;
+    const stream = try conn.streams.openStream(65535, 65535);
+    try stream.sendHeaders(false);
+
+    const event = try conn.recvFrame();
+    try std.testing.expect(event == .rst_stream);
+    try std.testing.expectEqual(stream.id, event.rst_stream.stream_id);
+    try std.testing.expectEqual(frame.ErrorCode.flow_control_error, event.rst_stream.error_code);
+    try std.testing.expect(stream.isClosed());
+    try std.testing.expectEqual(stream_mod.CloseReason.reset_local, stream.close_reason.?);
+    try std.testing.expectEqual(@as(u32, 65535), stream.send_window.available());
+
+    // RST_STREAM(FLOW_CONTROL_ERROR) went out for the stream.
+    const out = pipe.written();
+    try std.testing.expectEqual(@as(usize, 13), out.len);
+    const hdr = frame.FrameHeader.decode(out[0..9]);
+    try std.testing.expectEqual(frame.FrameType.rst_stream, hdr.frame_type);
+    try std.testing.expectEqual(stream.id, hdr.stream_id);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(frame.ErrorCode.flow_control_error)), std.mem.readInt(u32, out[9..13], .big));
+
+    const next = try conn.recvFrame();
+    try std.testing.expect(next == .window_update);
+    try std.testing.expectEqual(State.open, conn.state);
+    try std.testing.expectEqual(@as(u32, 65535 + 1000), conn.flow_control.availableSend());
+}
+
+test "connection WINDOW_UPDATE past 2^31-1 is a connection error" {
+    const allocator = std.testing.allocator;
+
+    var input = std.ArrayListUnmanaged(u8).empty;
+    defer input.deinit(allocator);
+    var wu_buf: [13]u8 = undefined;
+    _ = try frame.buildWindowUpdate(0, 0x7FFFFFFF, &wu_buf);
+    try input.appendSlice(allocator, &wu_buf);
+
+    var pipe = TestPipe.init(allocator, input.items);
+    defer pipe.deinit();
+    var conn = Connection.init(pipe.reader(), pipe.writer(), .{});
+    conn.state = .open;
+    const stream = try conn.streams.openStream(65535, 65535);
+    try stream.sendHeaders(false);
+
+    try std.testing.expectError(ConnectionError.FlowControlError, conn.recvFrame());
+    // Neither window took the increment, and no stream was reset for it.
+    try std.testing.expectEqual(@as(u32, 65535), conn.flow_control.availableSend());
+    try std.testing.expectEqual(@as(u32, 65535), stream.send_window.available());
+    try std.testing.expectEqual(stream_mod.State.open, stream.state);
+    try std.testing.expectEqual(@as(usize, 0), pipe.written().len);
 }
 
 test "maybeUpdateStreamWindow sends WINDOW_UPDATE when threshold exceeded" {
